@@ -1,0 +1,27 @@
+cd C:\Users\danma\OneDrive - University of Birmingham\Projects\External Repositories\InstantSplat
+
+activate instantsplat
+
+
+
+
+
+
+python coarse_init_infer.py --n_views 3 --img_base_path "C:\Users\danma\OneDrive - University of Birmingham\Projects\External Repositories\InstantSplat\data\sora\santorini\3_views"
+
+
+python train_joint.py -s "C:\Users\danma\OneDrive - University of Birmingham\Projects\External Repositories\InstantSplat\data\sora\santorini\3_views" -m "C:\Users\danma\OneDrive - University of Birmingham\Projects\External Repositories\InstantSplat\data\sora\santorini\3_views" --n_views 3 --scene "santorini" --iter 1000 --optim_pose
+
+
+python render_by_interp.py -s "C:\Users\danma\OneDrive - University of Birmingham\Projects\External Repositories\InstantSplat\data\sora\santorini\3_views" -m "C:\Users\danma\OneDrive - University of Birmingham\Projects\External Repositories\InstantSplat\data\sora\santorini\3_views" --n_views 3 --scene "santorini" --iter 1000 --eval --get_video
+
+
+
+
+
+python coarse_init_infer.py --n_views 10 --img_base_path "C:\Users\danma\OneDrive - University of Birmingham\Projects\External Repositories\InstantSplat\data\db\playroom\10_views"
+
+python train_joint.py -s "C:\Users\danma\OneDrive - University of Birmingham\Projects\External Repositories\InstantSplat\data\db\playroom\10_views" -m "C:\Users\danma\OneDrive - University of Birmingham\Projects\External Repositories\InstantSplat\data\db\playroom\10_views" --n_views 10 --scene "playroom" --iter 1000 --optim_pose "SQE"
+
+
+python render_by_interp.py -s "C:\Users\danma\OneDrive - University of Birmingham\Projects\External Repositories\InstantSplat\data\db\playroom\10_views" -m "C:\Users\danma\OneDrive - University of Birmingham\Projects\External Repositories\InstantSplat\data\db\playroom\10_views" --n_views 10 --scene "playroom" --iter 1000 --eval --get_video
