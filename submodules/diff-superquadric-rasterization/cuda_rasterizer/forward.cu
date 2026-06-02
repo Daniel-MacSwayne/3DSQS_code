@@ -69,15 +69,26 @@ __global__ void preprocessCUDA(
     means2D_out[idx] = { px, py };
     depths_out[idx]  = z;
 
-    // Step 3: estimate pixel-space bounding radius
-    //   radius ≈ norm(scales) / clamp(e3, 0.5, 1) / z * f_mean
-    //   (matches rasterizer3() lines 497-498 in __init__.py)
+    // Step 3: estimate pixel-space bounding radius — covering the full alpha-visible footprint.
+    //
+    // The weight at a pixel is G = exp(-F) where F = d4^e3.
+    // We render a pixel only when alpha = opacity * G >= 1/255.
+    // At the threshold (worst case opacity≈1): G = 1/255  →  F = ln(255) ≈ 5.5
+    //   d4^e3 = 5.5  →  d4 = 5.5^(1/e3)
+    //
+    // The spatial extent of d4 = threshold maps to scale * 5.5^(1/e3) in world space.
+    // In screen space this becomes:  radius = scale_norm * 5.5^(1/e3) / z * f_mean
+    //
+    // Previous formula used scale_norm / clamp(e3,0.5,1) which underestimates by:
+    //   5.5x at e3=1.0,  6x at e3=0.9,  1.4x at e3=5.0 — causing black tile gaps.
     float s0 = scales[idx*3+0], s1 = scales[idx*3+1], s2 = scales[idx*3+2];
     float e3 = exps[idx*3+2];
     float scale_norm = sqrtf(s0*s0 + s1*s1 + s2*s2);
-    float e3_clamped = fmaxf(0.5f, fminf(e3, 1.0f));
-    int radius = (int)ceilf(scale_norm / e3_clamped / z * f_mean);
-    radius = max(1, radius);
+    // d4 at the alpha=1/255 cutoff boundary
+    float threshold_d4 = powf(5.5f, 1.0f / fmaxf(e3, 0.1f));
+    int radius = (int)ceilf(scale_norm * threshold_d4 / z * f_mean);
+    // Cap at image diagonal to prevent degenerate huge radii from very large splats
+    radius = max(1, min(radius, (int)sqrtf((float)(W*W + H*H))));
     radii_out[idx] = radius;
 
     // Step 4: tile overlap count

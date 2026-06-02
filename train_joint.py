@@ -221,12 +221,8 @@ def prepare_output_and_logger(args):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
+    # TensorBoard writer disabled — event files clutter the results folder
     tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
     return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
@@ -292,7 +288,7 @@ class SceneTrainer(Trainer):
         self.device = args.device
     
         first_iter = 0
-        self.tb_writer = prepare_output_and_logger(dataset)
+        self.tb_writer = None  # TensorBoard disabled; prepare_output_and_logger skipped
 
         # print(self.dataset.splat_type)
         # sys.exit()
@@ -328,16 +324,23 @@ class SceneTrainer(Trainer):
     
         self.viewpoint_stack = None
         self.ema_loss_for_log = 0.0
-        self.progress_bar = tqdm(range(first_iter, self.opt.iterations), desc="Training progress")
+        # progress bar is handled by Trainer.train() — don't create a second one here
         first_iter += 1
         
         
         super().__init__(model=self.gaussians,
-                         train_num_steps=self.opt.iterations)
+                         train_num_steps=self.opt.iterations,
+                         results_folder=self.args.results)  # redirect to capital-R Results/
+
+        os.makedirs(os.path.join(self.args.results, "train"), exist_ok=True)
 
         if args.step != 0:
             self.gaussians.load_ply(self.args.results + '/model.ply')
             self.step = args.step
+        else:
+            csv_path = self.args.results + '/results_train.csv'
+            if os.path.isfile(csv_path):
+                os.remove(csv_path)
 
         # total_memory = torch.cuda.get_device_properties(0).total_memory / 2**30
         # allocated_memory = torch.cuda.memory_allocated(0) / 2**30
@@ -351,8 +354,6 @@ class SceneTrainer(Trainer):
         
         
     def on_train_step(self):
-
-        os.makedirs(os.path.join(self.args.results, "train"), exist_ok=True)
 
         self.gaussians._xyz.retain_grad()
 
@@ -392,8 +393,8 @@ class SceneTrainer(Trainer):
         # Pick a random Camera
         if not self.viewpoint_stack:
             self.viewpoint_stack = self.scene.getTrainCameras().copy()
-        viewpoint_cam = self.viewpoint_stack.pop(0)
-        # viewpoint_cam = self.viewpoint_stack.pop(randint(0, len(self.viewpoint_stack)-1))
+        # viewpoint_cam = self.viewpoint_stack.pop(0)
+        viewpoint_cam = self.viewpoint_stack.pop(randint(0, len(self.viewpoint_stack)-1))
         pose = self.gaussians.get_RT(viewpoint_cam.uid)
 
         # print(viewpoint_cam.uid)
@@ -561,23 +562,22 @@ class SceneTrainer(Trainer):
         # print("instantsplat_train_time_mean: ", train_time.mean())
         # print("instantsplat_train_time_median: ", np.median(train_time))
 
-        if os.path.isfile(self.args.results + '/results_train.csv'):
-            results = pd.read_csv(self.args.results + '/results_train.csv', index_col=None)
-        else:
-            results = pd.DataFrame(columns=['L1', 'SSIM', 'PSNR', 'Loss', 'LPIPS', 'Allocated_GPU', 'Available_GPU'])
+        if self.step % 100 == 0:
+            if os.path.isfile(self.args.results + '/results_train.csv'):
+                results = pd.read_csv(self.args.results + '/results_train.csv', index_col=None)
+            else:
+                results = pd.DataFrame(columns=['L1', 'SSIM', 'PSNR', 'Loss', 'LPIPS', 'N_Splats', 'Allocated_GPU', 'Available_GPU'])
 
-        df = pd.DataFrame({'L1':[L1.item()], 'SSIM':[1-SSIM.item()], 'PSNR':[PSNR.item()], 'Loss':[loss.item()], 'LPIPS':[LPIPS.item()], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
-        results = pd.concat([results, df], ignore_index=True)
-        results.to_csv(self.args.results + "/results_train.csv", index=False)
-            
-        img = (image.clamp(0, 1) * 255).to(dtype=torch.uint8).permute(1, 2, 0).detach().cpu().numpy()
-        img = Image.fromarray(img)
-        # print(img.shape, image.dtype)
-        name = '0' * (4 - len(str(self.step))) + str(self.step)
-        img.save(self.args.results + f"/train/{name}.png")
+            df = pd.DataFrame({'L1':[L1.item()], 'SSIM':[1-SSIM.item()], 'PSNR':[PSNR.item()], 'Loss':[loss.item()], 'LPIPS':[LPIPS.item()], 'N_Splats':[self.gaussians.get_xyz.shape[0]], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
+            results = pd.concat([results, df], ignore_index=True)
+            results.to_csv(self.args.results + "/results_train.csv", index=False)
 
-        # if (self.step + 1) % 1 == 0
-        self.gaussians.save_ply(self.args.results + f'/model.ply')
+            img = (image.clamp(0, 1) * 255).to(dtype=torch.uint8).permute(1, 2, 0).detach().cpu().numpy()
+            img = Image.fromarray(img)
+            name = '0' * (4 - len(str(self.step))) + str(self.step)
+            img.save(self.args.results + f"/train/{name}.png")
+
+            self.gaussians.save_ply(self.args.results + f'/model.ply')
         # self.gaussians.load_ply(self.args.results + '/model.ply')
 
         # torch.autograd.set_detect_anomaly(False)
@@ -596,29 +596,40 @@ class SceneTrainer(Trainer):
 
     
     def on_densify_step(self, render_pkg):
-        print('Densifying')
-        
-        image = render_pkg["render"]                                 # (3, H, W)
-        depth = render_pkg["depth"]                                  # (H, W)
-        visibility_filter = render_pkg["visibility_filter"]          # (N,)
-        radii = render_pkg["radii"]                                  # (M,)
+        # on_densify_step: Update screen-size tracking and run clone/prune.
+        #
+        # Steps:
+        #   1. Extract visibility and radii from render_pkg
+        #   2. Update max_radii2D for all currently visible splats
+        #   3. Clone high-gradient splats and prune low-opacity / large-screen ones
+        #   4. Cap total splat count at max_splats
 
-        # Densification
-        # Keep track of max radii in image-space for pruning
-        # print(self.gaussians.max_radii2D.max(), visibility_filter.shape)
-        
-        # self.gaussians.max_radii2D[visibility_filter] =                                                                   torch.max(self.gaussians.max_radii2D[visibility_filter], radii)
-        # self.gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-        # self.gaussians.add_densification_stats(self.gaussians._xyz, visibility_filter)
+        # Step 1: unpack
+        visibility_filter = render_pkg["visibility_filter"]   # (N,) bool — frustum culling mask
+        radii             = render_pkg["radii"]               # (M,) int  — pixel-space radii of visible splats
 
-        # print(self.gaussians._xyz.grad.shape, self.gaussians._xyz.grad.max())
+        # Step 2: track largest screen-space radius seen per splat (for size-based pruning)
+        self.gaussians.max_radii2D[visibility_filter] = torch.max(
+            self.gaussians.max_radii2D[visibility_filter],
+            radii.float())
 
+        # Step 3: clone and prune
         if self.step > self.opt.densify_from_iter and self.step % self.opt.densification_interval == 0:
             size_threshold = 20 if self.step > self.opt.opacity_reset_interval else None
-            self.gaussians.densify_and_prune(self.opt.densify_grad_threshold, 0.1,                                          self.scene.cameras_extent, size_threshold)
+            self.gaussians.densify_and_prune(
+                self.opt.densify_grad_threshold, 0.1,
+                self.scene.cameras_extent, size_threshold)
+            print(f'  [densify] splats after clone+prune: {self.gaussians.get_xyz.shape[0]}')
 
-        # print(self.gaussians._xyz.shape)
-        # print(self.gaussians._xyz.grad.shape, self.gaussians._xyz.grad.max())
+        # Step 4: hard cap — prune randomly if splat count exceeds max_splats
+        N = self.gaussians.get_xyz.shape[0]
+        if N > self.args.max_splats:
+            keep = torch.ones(N, dtype=torch.bool, device=self.gaussians.get_xyz.device)
+            # Mark a random selection of excess splats for removal
+            excess_indices = torch.randperm(N, device=self.gaussians.get_xyz.device)[self.args.max_splats:]
+            keep[excess_indices] = False
+            self.gaussians.prune_points(~keep)
+            print(f'  [densify] capped to max_splats={self.args.max_splats}')
 
         return
 
