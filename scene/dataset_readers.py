@@ -86,7 +86,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, eval):
         else:
             extr = cam_extrinsics[key]
             intr = cam_intrinsics[extr.camera_id]
-            uid = intr.id
+            uid = idx + 1
 
         height = intr.height
         width = intr.width            

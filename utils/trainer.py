@@ -175,7 +175,7 @@ class Trainer(object):
                     for param in group['params']:
                         if param.grad is not None:
                             nan_mask = torch.isnan(param.grad)
-                            print(nan_mask.sum())
+                            # print(nan_mask.sum())
                             if nan_mask.any():
                                 param.grad[nan_mask] = 0.0
                             param.grad = param.grad.clamp(-1e3, 1e3)

@@ -49,7 +49,7 @@ torch.cuda.empty_cache()
 # device = torch.device('cuda')
 # device = torch.device('cpu')
 
-lpips_model = lpips.LPIPS(net='alex')#.to(device=device)
+lpips_model = lpips.LPIPS(net='alex').cuda()
 
 from torchviz import make_dot  # Install: pip install torchviz
 
@@ -436,10 +436,10 @@ class SceneTrainer(Trainer):
         diff = ((I - I_GT)**2).sum(axis=-1) # (H, W)
         D = depth.clip(0, 3).detach().cpu().numpy() # (H, W)
         
-        plt.imshow(I_GT), plt.show()
-        plt.imshow(I), plt.show()
-        plt.imshow(diff), plt.show()
-        plt.imshow(D, cmap='jet_r'), plt.show()
+        # plt.imshow(I_GT), plt.show()
+        # plt.imshow(I), plt.show()
+        # plt.imshow(diff), plt.show()
+        # plt.imshow(D, cmap='jet_r'), plt.show()
 
         # print(image.shape, gt_image.shape)
         # print(image.dtype, gt_image.dtype)
@@ -476,10 +476,10 @@ class SceneTrainer(Trainer):
         available_memory = total_memory - reserved_memory
         # print(f"Total GPU Memory: {total_memory / (1024**3):.2f} GB")
         # print(f"Reserved GPU Memory: {reserved_memory / (1024**3):.2f} GB")
-        print(f"Allocated GPU Memory: {allocated_memory / (1024**3):.2f} GB")
+        # print(f"Allocated GPU Memory: {allocated_memory / (1024**3):.2f} GB")
         # print(f"Available (Unallocated) GPU Memory: {available_memory / (1024**3):.2f} GB")
 
-        print_memory_usage()
+        # print_memory_usage()
         
         if self.step == 0:
             print(gt_image.shape)
@@ -561,8 +561,8 @@ class SceneTrainer(Trainer):
         # print("instantsplat_train_time_mean: ", train_time.mean())
         # print("instantsplat_train_time_median: ", np.median(train_time))
 
-        if os.path.isfile(self.args.results + 'results_train.csv'):
-            results = pd.read_csv(self.args.results + 'results_train.csv', index_col=None)
+        if os.path.isfile(self.args.results + '/results_train.csv'):
+            results = pd.read_csv(self.args.results + '/results_train.csv', index_col=None)
         else:
             results = pd.DataFrame(columns=['L1', 'SSIM', 'PSNR', 'Loss', 'LPIPS', 'Allocated_GPU', 'Available_GPU'])
 
@@ -787,8 +787,8 @@ if __name__ == "__main__":
 
 
     
-    # trainer.train()
-    trainer.evaluate()
+    trainer.train()
+    # trainer.evaluate()
 
 
     
