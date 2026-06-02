@@ -29,6 +29,17 @@ import gc
 from .Superquadric_Splatting import *
 # from Plotly_Functions import *
 
+# Try to import the CUDA superquadric rasterizer.
+# Falls back to the Python rasterizer3() if the extension is not yet built.
+try:
+    from diff_superquadric_rasterization import (
+        SuperquadricRasterizationSettings,
+        SuperquadricRasterizer,
+    )
+    _CUDA_SQ_AVAILABLE = True
+except ImportError:
+    _CUDA_SQ_AVAILABLE = False
+
 # tc.manual_seed(0)
 # np.random.seed(0)
 tc.autograd.set_detect_anomaly(False)
@@ -252,19 +263,44 @@ def render2(
 
     # print(rel_w2c.shape, gaussians_xyz.shape, gaussians_rot.shape, visible.shape, means3D.shape, scales.shape, rotations.shape, colors_precomp.shape)
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen).
-    render_color, render_depth, radii = rasterizer3(
-        camera=viewpoint_camera,
-        means3D=means3D,
-        # means2D=means2D,
-        # shs=shs,
-        colors_precomp=colors_precomp,
-        opacity=opacity,
-        scales=scales,
-        rotations=rotations,
-        exps=exp,
-        # cov3D_precomp=cov3D_precomp,
-    )
+    # Rasterize visible splats to image.
+    # Uses the CUDA superquadric rasterizer if built, otherwise falls back to
+    # the Python rasterizer3() implementation.
+    if _CUDA_SQ_AVAILABLE:
+        # CUDA path:
+        #   Steps:
+        #     1. Build rasterization settings from camera intrinsics and viewmatrix
+        #     2. Construct rasterizer module and run forward pass
+        #     3. Unpack (render_color, render_depth, radii)
+        sq_settings = SuperquadricRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width =int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=bg_color,
+            # world_view_transform is camera-to-world stored transposed — exactly what R_cw expects
+            viewmatrix=viewpoint_camera.world_view_transform.to(dtype=dtype, device=device),
+        )
+        sq_rasterizer = SuperquadricRasterizer(raster_settings=sq_settings)
+        render_color, render_depth, radii = sq_rasterizer(
+            means3D=means3D,
+            colors=colors_precomp,
+            opacity=opacity,
+            scales=scales,
+            rotations=rotations,
+            exps=exp,
+        )
+    else:
+        # Python fallback path (original rasterizer3)
+        render_color, render_depth, radii = rasterizer3(
+            camera=viewpoint_camera,
+            means3D=means3D,
+            colors_precomp=colors_precomp,
+            opacity=opacity,
+            scales=scales,
+            rotations=rotations,
+            exps=exp,
+        )
 
     render_pkg =  {
         "render": render_color,                           # (3, H, W)
