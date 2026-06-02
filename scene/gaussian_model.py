@@ -684,12 +684,11 @@ class GaussianModel2:
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
 
-        # I = np.zeros(pcd.points.shape[0], dtype=np.bool)
-        # I[np.random.permutation(pcd.points.shape[0])[:self.max_splats]] = True
-        # points = pcd.points[I]
-        # colors = pcd.colors[I]
-        points = pcd.points
-        colors = pcd.colors
+        # Subsample to max_splats using random permutation (matches GaussianModel behaviour)
+        I = np.zeros(pcd.points.shape[0], dtype=bool)
+        I[np.random.permutation(pcd.points.shape[0])[:self.max_splats]] = True
+        points = pcd.points[I]
+        colors = pcd.colors[I]
 
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(points)).to(dtype=self.dtype, device=self.device)
@@ -712,7 +711,7 @@ class GaussianModel2:
         # self._exp = self.get_exp
 
         # opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1)).to(dtype=self.dtype, device=device))
-        opacities = inverse_sigmoid(.8 * torch.ones((fused_point_cloud.shape[0], 1)).to(dtype=self.dtype, device=self.device))
+        opacities = inverse_sigmoid(.5 * torch.ones((fused_point_cloud.shape[0], 1)).to(dtype=self.dtype, device=self.device))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))

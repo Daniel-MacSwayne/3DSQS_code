@@ -332,7 +332,8 @@ class SceneTrainer(Trainer):
                          train_num_steps=self.opt.iterations,
                          results_folder=self.args.results)  # redirect to capital-R Results/
 
-        os.makedirs(os.path.join(self.args.results, "train"), exist_ok=True)
+        os.makedirs(os.path.join(self.args.results, "train", "rgb"),   exist_ok=True)
+        os.makedirs(os.path.join(self.args.results, "train", "depth"), exist_ok=True)
 
         if args.step != 0:
             self.gaussians.load_ply(self.args.results + '/model.ply')
@@ -562,7 +563,7 @@ class SceneTrainer(Trainer):
         # print("instantsplat_train_time_mean: ", train_time.mean())
         # print("instantsplat_train_time_median: ", np.median(train_time))
 
-        if self.step % 100 == 0:
+        if self.step % 100 == 0 or self.step == self.opt.iterations - 1:
             if os.path.isfile(self.args.results + '/results_train.csv'):
                 results = pd.read_csv(self.args.results + '/results_train.csv', index_col=None)
             else:
@@ -572,10 +573,26 @@ class SceneTrainer(Trainer):
             results = pd.concat([results, df], ignore_index=True)
             results.to_csv(self.args.results + "/results_train.csv", index=False)
 
-            img = (image.clamp(0, 1) * 255).to(dtype=torch.uint8).permute(1, 2, 0).detach().cpu().numpy()
-            img = Image.fromarray(img)
-            name = '0' * (4 - len(str(self.step))) + str(self.step)
-            img.save(self.args.results + f"/train/{name}.png")
+            name = f'{self.step:06d}'
+
+            # RGB render
+            img_np = (image.clamp(0, 1) * 255).to(dtype=torch.uint8).permute(1, 2, 0).detach().cpu().numpy()
+            Image.fromarray(img_np).save(self.args.results + f"/train/rgb/{name}.png")
+
+            # Depth map — viridis colourmap, closer = yellow, far = purple
+            d_np = depth.detach().cpu().numpy()
+            mask = d_np > 0
+            d_norm = np.zeros_like(d_np)
+            if mask.any():
+                lo, hi = d_np[mask].min(), d_np[mask].max()
+                if hi > lo:
+                    d_norm[mask] = 1.0 - (d_np[mask] - lo) / (hi - lo)  # invert: closer = 1
+                else:
+                    d_norm[mask] = 0.5
+            cmap = plt.get_cmap('viridis')
+            depth_rgb = (cmap(d_norm)[:, :, :3] * 255).astype(np.uint8)
+            depth_rgb[~mask] = 0
+            Image.fromarray(depth_rgb).save(self.args.results + f"/train/depth/{name}.png")
 
             self.gaussians.save_ply(self.args.results + f'/model.ply')
         # self.gaussians.load_ply(self.args.results + '/model.ply')
@@ -636,7 +653,8 @@ class SceneTrainer(Trainer):
 
     def evaluate(self):
 
-        os.makedirs(os.path.join(self.args.results, "eval"), exist_ok=True)
+        os.makedirs(os.path.join(self.args.results, "eval", "rgb"),   exist_ok=True)
+        os.makedirs(os.path.join(self.args.results, "eval", "depth"), exist_ok=True)
 
         self.gaussians.load_ply(self.args.results + '/model.ply')
 
@@ -691,15 +709,7 @@ class SceneTrainer(Trainer):
             PSNR = psnr(image, gt_image)
             LPIPS = lpips_model(image, gt_image)
 
-            I = image.permute(1, 2, 0).detach().cpu().numpy() # (H, W, 3)
-            I_GT = gt_image.permute(1, 2, 0).detach().cpu().numpy() # (H, W, 3)
-            diff = ((I - I_GT)**2).sum(axis=-1) # (H, W)
-            D = depth.clip(0, 3).detach().cpu().numpy() # (H, W)
-            
-            plt.imshow(I_GT), plt.show()
-            plt.imshow(I), plt.show()
-            plt.imshow(diff), plt.show()
-            plt.imshow(D, cmap='jet_r'), plt.show()
+            # (display calls removed — saves to eval/rgb and eval/depth instead)
 
             
             
@@ -721,19 +731,26 @@ class SceneTrainer(Trainer):
             results = pd.concat([results, df], ignore_index=True)
             results.to_csv(self.args.results + "/results_eval.csv", index=False)
 
-            # image = image.clip(0, 1) * 255
-            img = (image.clip(0, 1) * 255).to(dtype=torch.uint8).permute(1, 2, 0).detach().cpu().numpy()
-            img = Image.fromarray(img)
-            # print(img.shape, image.dtype)
-            name = '0' * (4 - len(str(i))) + str(i)
-            img.save(self.args.results + f"/eval/{name}.png")
+            name = f'{i:06d}'
 
-            depth_img = (depth - depth.min()) / (depth.max() - depth.min())
-            depth_img = (depth_img * 255).to(dtype=torch.uint8).detach().cpu().numpy()
-            depth_img = Image.fromarray(depth_img)
-            # print(img.shape, image.dtype)
-            name = 'd' + '0' * (4 - len(str(i))) + str(i)
-            depth_img.save(self.args.results + f"/eval/{name}.png")
+            # RGB render
+            img_np = (image.clip(0, 1) * 255).to(dtype=torch.uint8).permute(1, 2, 0).detach().cpu().numpy()
+            Image.fromarray(img_np).save(self.args.results + f"/eval/rgb/{name}.png")
+
+            # Depth map — viridis colourmap, closer = yellow, far = purple
+            d_np = depth.detach().cpu().numpy()
+            mask = d_np > 0
+            d_norm = np.zeros_like(d_np)
+            if mask.any():
+                lo, hi = d_np[mask].min(), d_np[mask].max()
+                if hi > lo:
+                    d_norm[mask] = 1.0 - (d_np[mask] - lo) / (hi - lo)
+                else:
+                    d_norm[mask] = 0.5
+            cmap = plt.get_cmap('viridis')
+            depth_rgb = (cmap(d_norm)[:, :, :3] * 255).astype(np.uint8)
+            depth_rgb[~mask] = 0
+            Image.fromarray(depth_rgb).save(self.args.results + f"/eval/depth/{name}.png")
 
         return results
 
