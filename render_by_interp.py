@@ -29,17 +29,27 @@ import imageio
 
 
 def save_interpolate_pose(model_path, iter, n_views):
+    # save_interpolate_pose: Interpolate between training camera poses for smooth video.
+    #
+    # Steps:
+    #   1. Load optimised poses from disk
+    #   2. Evenly subsample to n_views keyframes (avoids hardcoded indices)
+    #   3. Interpolate between consecutive pairs at ~30fps for 10 seconds per pair
+    #   4. Save interpolated pose sequence to pose_interpolated.npy
 
-    # org_pose = np.load(model_path + f"/pose/pose_{iter}.npy")
-    org_pose = np.load(model_path + f"/pose/pose_org.npy")
+    org_pose = np.load(model_path + f"/pose/pose_org.npy")   # (N, 4, 4)
 
-    org_pose = org_pose[[22, 19]]
-    
+    # Step 2: evenly subsample to n_views keyframes across the full pose sequence
+    n_total   = len(org_pose)
+    indices   = np.linspace(0, n_total - 1, min(n_views, n_total), dtype=int)
+    org_pose  = org_pose[indices]
+
     visualizer(org_pose, ["green" for _ in org_pose], model_path + "/pose/poses_optimized.png")
-    # n_interp = int(10 * 30 / n_views)  # 10second, fps=30
-    n_interp = int(10 * 30 / n_views)  # 10second, fps=30
+
+    # Step 3: interpolate between consecutive keyframe pairs
+    n_interp = max(2, int(10 * 30 / max(len(org_pose) - 1, 1)))  # frames per segment
     all_inter_pose = []
-    for i in range(n_views-1):
+    for i in range(len(org_pose) - 1):
         tmp_inter_pose = generate_interpolated_path(poses=org_pose[i:i+2], n_interp=n_interp)
         all_inter_pose.append(tmp_inter_pose)
     all_inter_pose = np.array(all_inter_pose).reshape(-1, 3, 4)
@@ -56,36 +66,43 @@ def save_interpolate_pose(model_path, iter, n_views):
 
 
 def images_to_video(image_folder, output_video_path, fps=30):
+    """images_to_video: Compile PNG frames in a folder into an MP4.
+
+    Steps:
+      1. Collect and sort PNG files in image_folder (skip subdirectories)
+      2. Read the first frame to get dimensions
+      3. Write all frames to an mp4v VideoWriter
     """
-    Convert images in a folder to a video.
-
-    Args:
-    - image_folder (str): The path to the folder containing the images.
-    - output_video_path (str): The path where the output video will be saved.
-    - fps (int): Frames per second for the output video.
-    """
-    images = []
-
-    # for filename in sorted(os.listdir(image_folder)):
-    #     if filename.endswith(('.png', '.jpg', '.jpeg', '.JPG', '.PNG')):
-    #         image_path = os.path.join(image_folder, filename)
-    #         image = imageio.imread(image_path)
-    #         images.append(image)
-
-    # imageio.mimwrite(output_video_path, images, fps=fps)
-
     import cv2
-    Filenames = sorted(os.listdir(image_folder))
-    # print(image_folder + '/' + Filenames[0])
-    Frame = cv2.imread(image_folder + '/' + Filenames[0], cv2.IMREAD_GRAYSCALE).shape[::-1]
+
+    # Step 1: sorted PNG files only (skip subdirectories like depth/)
+    Filenames = sorted([
+        f for f in os.listdir(image_folder)
+        if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+        and os.path.isfile(os.path.join(image_folder, f))
+    ])
+    if not Filenames:
+        print(f"[images_to_video] No image files found in {image_folder}")
+        return
+
+    # Step 2: get frame dimensions from first image
+    first_path = os.path.join(image_folder, Filenames[0])
+    first = cv2.imread(first_path)
+    if first is None:
+        print(f"[images_to_video] Could not read {first_path}")
+        return
+    h, w = first.shape[:2]
+    frameSize = (w, h)
+
+    # Step 3: write all frames
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    Video = cv2.VideoWriter(output_video_path, fourcc, fps=30, frameSize=Frame)
-        
+    Video  = cv2.VideoWriter(output_video_path, fourcc, fps, frameSize)
     for File in Filenames:
-        Video.write(cv2.imread(image_folder + '/' + File))
-            
+        frame = cv2.imread(os.path.join(image_folder, File))
+        if frame is not None:
+            Video.write(frame)
     Video.release()
-    return
+    print(f"Video saved: {output_video_path}  ({len(Filenames)} frames @ {fps}fps)")
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, args):
     # render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -144,10 +161,7 @@ def render_sets(
 
         scene.gaussians.load_ply(args.results + '/model.ply')
         gaussians.splat_type = dataset.splat_type
-
-        scene.gaussians._exp12 = scene.gaussians._exp12 * 0 + 1
-        scene.gaussians._exp3 = scene.gaussians._exp3 * 0 + -3.688879454216
-        scene.gaussians._xyz += (torch.rand_like(scene.gaussians._xyz) - 0.5)*0.0005
+        # Note: do NOT modify _exp12/_exp3/_xyz here — render the model as-is
         
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -175,11 +189,8 @@ def render_sets(
     )
 
     if args.get_video:
-        # image_folder = os.path.join(args.model_path, f'interp/ours_{args.iteration}/renders')
-        # image_folder = os.path.join(args.model_path, f'interp/ours_None/renders')
-        image_folder = os.path.join(args.results, f'interp/')
-        # print(image_folder)
-        # output_video_file = os.path.join(args.results, f'{args.scene}_{args.n_views}_{args.splat_type}_view.mp4')
+        # Render images are saved to interp/render/ — point video compiler there
+        image_folder      = os.path.join(args.results, 'interp', 'render')
         output_video_file = os.path.join(args.results, f'{args.scene}_{args.n_views}_{args.splat_type}_view.mp4')
         images_to_video(image_folder, output_video_file, fps=30)
 

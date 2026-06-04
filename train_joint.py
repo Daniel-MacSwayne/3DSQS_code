@@ -288,13 +288,25 @@ class SceneTrainer(Trainer):
         self.device = args.device
     
         first_iter = 0
-        self.tb_writer = None  # TensorBoard disabled; prepare_output_and_logger skipped
+        self.tb_writer = prepare_output_and_logger(dataset)  # writes cfg_args needed by render_by_interp
 
         # print(self.dataset.splat_type)
         # sys.exit()
         
-        # if self.dataset.splat_type == 'GS':
-        #     self.gaussians = GaussianModel(dataset.sh_degree, self.dtype, self.args.max_splats)
+        # If --init_type dust3r, redirect source_path to the dust3r/ sibling folder.
+        # coarse_init_infer.py saves its output there (cameras.txt, images.txt, points3D.ply)
+        # so the scene loader picks it up without any other changes.
+        if getattr(args, 'init_type', 'colmap') == 'dust3r':
+            scene_root  = os.path.dirname(self.dataset.source_path.rstrip('/'))
+            dust3r_path = os.path.join(scene_root, 'dust3r')
+            if os.path.exists(dust3r_path):
+                print(f'Init: DUSt3R  ({dust3r_path})')
+                self.dataset.source_path = dust3r_path
+            else:
+                print(f'Init: DUSt3R requested but {dust3r_path} not found — falling back to COLMAP')
+        else:
+            print(f'Init: COLMAP  ({self.dataset.source_path})')
+
         if self.dataset.splat_type in ['GS', 'GSE', 'SQ', 'SQE']:
             self.gaussians = GaussianModel2(dataset.sh_degree, self.dtype, self.args.max_splats, self.device)
 
@@ -657,8 +669,7 @@ class SceneTrainer(Trainer):
         os.makedirs(os.path.join(self.args.results, "eval", "depth"), exist_ok=True)
 
         self.gaussians.load_ply(self.args.results + '/model.ply')
-
-        self.gaussians._exp12 = nn.Parameter(torch.zeros_like(self.gaussians._exp12, dtype=self.dtype, device=self.device).requires_grad_(False))
+        # Evaluate the model as-is — do not reset shape parameters
         
         # self.gaussians.load_ply(self.args.results[:-3] + 'GSE/' + '/model.ply')
         # self.gaussians._exp3 = nn.Parameter(torch.zeros_like(self.gaussians._exp3, dtype=self.dtype, device=self.device-3.688879454216).requires_grad_(True)) 
@@ -679,7 +690,7 @@ class SceneTrainer(Trainer):
             viewpoint_cam = self.viewpoint_stack.pop(0)
             pose = self.gaussians.get_RT(viewpoint_cam.uid)
 
-            bg = torch.rand((3), device=device) if self.opt.random_background else self.background
+            bg = torch.rand((3), device=self.device) if self.opt.random_background else self.background
 
             # Free intermediate variables after the backward pass if they're no longer needed
             render_pkg = None  # Free intermediate variable by removing reference
@@ -782,6 +793,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_splats", type=int, default=200000)
     parser.add_argument("--step", type=int, default=0)
     parser.add_argument("--device", type=str, default='cuda')
+    parser.add_argument("--init_type", type=str, default='colmap',
+                        choices=['colmap', 'dust3r'],
+                        help="Point cloud initialisation: 'colmap' (default) or "
+                             "'dust3r' (requires coarse_init_infer.py to have been run first)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -816,7 +831,7 @@ if __name__ == "__main__":
 
     
     trainer.train()
-    # trainer.evaluate()
+    trainer.evaluate()
 
 
     

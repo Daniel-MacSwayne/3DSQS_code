@@ -202,26 +202,18 @@ def storePly(path, xyz, rgb):
     ply_data.write(path)
 
 def readColmapSceneInfo(path, images, eval, args, opt, llffhold=2):
-    # try:
-    #     cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
-    #     cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
-    #     cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
-    #     cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
-    # except:
-
-    ##### For initializing test pose using PCD_Registration
-    if eval and opt.get_video==False:    
+    # Try binary first (Mip_nerf_360 uses .bin), fall back to text (Deep_Blending uses .txt)
+    sparse0 = os.path.join(path, "sparse/0")
+    if eval and not getattr(opt, 'get_video', False):
         print("Loading initial test pose for evaluation.")
-        cameras_extrinsic_file = os.path.join(path, "/init_test_pose/sparse/0", "images.txt")
-    else:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
-        # cameras_extrinsic_file = os.path.join(path, "sparse", "images.txt")
+        sparse0 = os.path.join(path, "init_test_pose/sparse/0")
 
-
-    cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
-    # cameras_intrinsic_file = os.path.join(path, "sparse", "cameras.txt")
-    cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
-    cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+    try:
+        cam_extrinsics = read_extrinsics_binary(os.path.join(sparse0, "images.bin"))
+        cam_intrinsics = read_intrinsics_binary(os.path.join(sparse0, "cameras.bin"))
+    except Exception:
+        cam_extrinsics = read_extrinsics_text(os.path.join(sparse0, "images.txt"))
+        cam_intrinsics = read_intrinsics_text(os.path.join(sparse0, "cameras.txt"))
 
     reading_dir = "images" if images == None else images
 
@@ -253,12 +245,14 @@ def readColmapSceneInfo(path, images, eval, args, opt, llffhold=2):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
+    colmap_ply  = os.path.join(path, "sparse/0/points3D.ply")
+    dust3r_ply  = os.path.join(path, "sparse/0/dust3r_points3D.ply")
+    bin_path    = os.path.join(path, "sparse/0/points3D.bin")
+    txt_path    = os.path.join(path, "sparse/0/points3D.txt")
+
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    # ply_path = os.path.join(path, "sparse/points3D.ply")
-    # bin_path = os.path.join(path, "sparse/points3D.bin")
-    # txt_path = os.path.join(path, "sparse/points3D.txt")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
