@@ -712,8 +712,9 @@ class GaussianModel2:
         exp12 = torch.tensor([[0, 0]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
         # exp12 = torch.tensor([[-1.25276, -1.25276]]).to(dtype=self.dtype, device=device).repeat(fused_point_cloud.shape[0], 1)
         # exp3 = torch.tensor([[-1.466337]]).to(dtype=self.dtype, device=device).repeat(fused_point_cloud.shape[0], 1)
-        # raw_e3=0 → sigmoid(0)*4.0+1.0 = 3.0 (moderate sharpness, matches new [1.0,5.0] range)
-        exp3 = torch.tensor([[0.0]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
+        # raw_e3=-1.945 → sigmoid(-1.945)*4.0+1.0 = 1.5 (near minimum, avoids gradient death at boundary)
+        # e1=e2=1.0 (sphere) and e3=1.5 (slightly sharp) at init — all close to 1.0 as requested
+        exp3 = torch.tensor([[-1.9459]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
         # self._exp = self.get_exp
 
         # opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1)).to(dtype=self.dtype, device=device))
