@@ -721,14 +721,14 @@ class SceneTrainer(Trainer):
         
         results = pd.DataFrame(columns=['L1', 'SSIM', 'PSNR', 'Loss', 'LPIPS', 'Allocated_GPU', 'Available_GPU'])
 
-        if not self.viewpoint_stack:
-            self.viewpoint_stack = self.scene.getTrainCameras().copy()
-        
-        for i in range(0, len(self.viewpoint_stack)):
-            
-            # Pick a random Camera
-            # viewpoint_cam = self.viewpoint_stack.pop(randint(0, len(self.viewpoint_stack)-1))
-            viewpoint_cam = self.viewpoint_stack.pop(0)
+        # Always evaluate ALL training cameras in order.
+        # The partial-stack bug: on_train_step pops cameras during training, so
+        # self.viewpoint_stack may have as few as 1 camera left when evaluate() runs
+        # (e.g. 30000 mod 19 = 18 consumed → 1 remaining for Aquarium-20).
+        all_cameras = self.scene.getTrainCameras().copy()
+
+        for i, viewpoint_cam in enumerate(all_cameras):
+            pose = self.gaussians.get_RT(viewpoint_cam.uid)
             pose = self.gaussians.get_RT(viewpoint_cam.uid)
 
             bg = torch.rand((3), device=self.device) if self.opt.random_background else self.background
