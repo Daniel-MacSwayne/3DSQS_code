@@ -524,7 +524,7 @@ class GaussianModel:
             _e3 = self.get_exp[:, 2].clamp(min=0.1) if hasattr(self, 'get_exp') else torch.ones(self.get_scaling.shape[0], device=self.get_scaling.device)
             _thr = torch.pow(torch.tensor(5.5, device=self.get_scaling.device), 1.0 / _e3)
             _eff = self.get_scaling.norm(dim=1) * _thr
-            big_points_ws = _eff > 0.1 * extent
+            big_points_ws = _eff > 1.0 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
@@ -637,8 +637,10 @@ class GaussianModel2:
     @property
     def get_exp(self):
         exp12 = self.exp_activation(self._exp12) * 1.8 + 0.1
-        # e3 ∈ [1.0, 5.0] — minimum 1.0 prevents soft halos (e3<1 made effective radius 6.7× geometric scale)
-        exp3 = self.exp_activation(self._exp3) * 4.0 + 1.0
+        # e3: use full [0.9, 5.0] range so e3=1.0 sits in the MIDDLE (not at saturation boundary),
+        # then clamp to min=1.0. Gradients are healthy throughout; below-1.0 updates are silently
+        # ignored by the clamp rather than vanishing at a sigmoid saturation point.
+        exp3 = torch.clamp(self.exp_activation(self._exp3) * 4.1 + 0.9, min=1.0)
         exp = torch.cat([exp12, exp3], dim=-1)
         return exp
 
@@ -719,7 +721,9 @@ class GaussianModel2:
         # exp3 = torch.tensor([[-1.466337]]).to(dtype=self.dtype, device=device).repeat(fused_point_cloud.shape[0], 1)
         # raw_e3=-1.945 → sigmoid(-1.945)*4.0+1.0 = 1.5 (near minimum, avoids gradient death at boundary)
         # e1=e2=1.0 (sphere) and e3=1.5 (slightly sharp) at init — all close to 1.0 as requested
-        exp3 = torch.tensor([[-1.9459]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
+        # raw=-3.6889 → sigmoid(-3.6889)*4.1+0.9 = 0.9999 → clamped to exactly 1.0
+        # 1.0 is in the middle of the activation range so gradients are non-zero (~0.10)
+        exp3 = torch.tensor([[-3.6889]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
         # self._exp = self.get_exp
 
         # opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1)).to(dtype=self.dtype, device=device))
@@ -1059,26 +1063,65 @@ class GaussianModel2:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_exp12, new_exp3)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
-        # grads = self.xyz_gradient_accum / self.denom
+        # densify_and_prune: grow the scene where under-represented, shrink splats that are too large.
+        #
+        # Steps:
+        #   1. Clone splats with high position gradients (under-reconstructed regions)
+        #   2. Split splats that are too large — halves their scale, preserves coverage.
+        #      Splitting instead of deleting is essential: deletion creates a black coverage gap
+        #      that the model cannot recover from (no splat remains to guide new ones in).
+        #   3. Prune truly dead splats (low opacity only — not size-based)
+
         grads = self._xyz.grad
         grads[grads.isnan()] = 0.0
 
+        # Step 1: clone under-represented splats
         self.densify_and_clone(grads, max_grad, extent)
-        # self.densify_and_split(grads, max_grad, extent)
 
+        # Step 2: split oversized splats rather than deleting them.
+        # Any splat whose effective radius (scale × 5.5^(1/e3)) exceeds 1× scene extent
+        # gets split into 2 copies at half scale, positioned within the original footprint.
+        _e3  = self.get_exp[:, 2].clamp(min=0.1)
+        _thr = torch.pow(torch.tensor(5.5, device=self.device), 1.0 / _e3)
+        _eff = self.get_scaling.norm(dim=1) * _thr
+        too_large = _eff > 1.0 * extent
+        if too_large.any():
+            self._split_splats(too_large)
+
+        # Step 3: prune only low-opacity splats (dead splats, not coverage splats)
         prune_mask = (self.get_opacity < min_opacity).squeeze()
-        if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            # Effective scale = geometric scale × d4 threshold at alpha=1/255 cutoff.
-            # e3=0.9 makes effective radius 6.7× geometric scale — raw scale misses these.
-            _e3 = self.get_exp[:, 2].clamp(min=0.1) if hasattr(self, 'get_exp') else torch.ones(self.get_scaling.shape[0], device=self.get_scaling.device)
-            _thr = torch.pow(torch.tensor(5.5, device=self.get_scaling.device), 1.0 / _e3)
-            _eff = self.get_scaling.norm(dim=1) * _thr
-            big_points_ws = _eff > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
+
+    def _split_splats(self, mask, N=2):
+        """_split_splats: Replace each masked splat with N smaller copies.
+
+        Steps:
+          1. Sample N random offsets within the original splat's scale footprint
+          2. Create N copies at halved scale positioned around the original centre
+          3. Remove the original via prune_filter
+        """
+        # Step 1: random offsets within the original scale
+        stds    = self.get_scaling[mask].repeat(N, 1)
+        samples = torch.normal(mean=torch.zeros_like(stds), std=stds)
+        rots    = build_rotation(self._rotation[mask]).repeat(N, 1, 1)
+
+        # Step 2: build new smaller splats
+        new_xyz   = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[mask].repeat(N, 1)
+        new_scale = self.scaling_inverse_activation(self.get_scaling[mask].repeat(N, 1) / (0.8 * N))
+        new_rot   = self._rotation[mask].repeat(N, 1)
+        new_e12   = self._exp12[mask].repeat(N, 1)
+        new_e3    = self._exp3[mask].repeat(N, 1)
+        new_fdc   = self._features_dc[mask].repeat(N, 1, 1)
+        new_frest = self._features_rest[mask].repeat(N, 1, 1)
+        new_op    = self._opacity[mask].repeat(N, 1)
+
+        self.densification_postfix(new_xyz, new_fdc, new_frest, new_op, new_scale, new_rot, new_e12, new_e3)
+
+        # Step 3: remove originals
+        prune_filter = torch.cat((mask, torch.zeros(N * mask.sum(), device=self.device, dtype=torch.bool)))
+        self.prune_points(prune_filter)
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)

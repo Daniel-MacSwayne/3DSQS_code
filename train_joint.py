@@ -40,7 +40,7 @@ from time import perf_counter
 
 import warnings
 import pandas as pd
-warnings.filterwarnings('ignore', category=FutureWarning, module='pandas')
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*DataFrame concatenation.*')
 from PIL import Image
 import matplotlib.pyplot as plt
 import lpips
@@ -487,7 +487,7 @@ class SceneTrainer(Trainer):
             _e3  = self.gaussians.get_exp[:, 2].clamp(min=0.1).detach()
             _thr = torch.pow(torch.tensor(5.5, device=self.device, dtype=self.dtype), 1.0 / _e3)
         _eff_scale   = self.gaussians.get_scaling.norm(dim=1) * _thr.detach()
-        _max_allowed = 0.1 * self.scene.cameras_extent
+        _max_allowed = 1.0 * self.scene.cameras_extent  # raised from 0.1× to match pruning threshold
         _excess      = torch.relu(_eff_scale - _max_allowed)
         L_scale      = _excess.pow(2).mean() * 0.01
         loss         = loss + L_scale
@@ -681,7 +681,11 @@ class SceneTrainer(Trainer):
 
         # Step 3: clone and prune
         if self.step > self.opt.densify_from_iter and self.step % self.opt.densification_interval == 0:
-            size_threshold = 20 if self.step > self.opt.opacity_reset_interval else None
+            # Screen-space size threshold disabled: the original value of 20px was
+            # calibrated for full-resolution images. At images_8 (624px wide) it removes
+            # background/sky splats that are legitimately needed for coverage.
+            # World-space effective-radius pruning in densify_and_prune handles oversized splats.
+            size_threshold = None
             self.gaussians.densify_and_prune(
                 self.opt.densify_grad_threshold, 0.1,
                 self.scene.cameras_extent, size_threshold)
