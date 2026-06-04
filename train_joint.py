@@ -38,7 +38,9 @@ except ImportError:
     
 from time import perf_counter
 
+import warnings
 import pandas as pd
+warnings.filterwarnings('ignore', category=FutureWarning, module='pandas')
 from PIL import Image
 import matplotlib.pyplot as plt
 import lpips
@@ -601,14 +603,24 @@ class SceneTrainer(Trainer):
         # print("instantsplat_train_time_median: ", np.median(train_time))
 
         if self.step % 100 == 0 or self.step == self.opt.iterations - 1:
-            if os.path.isfile(self.args.results + '/results_train.csv'):
-                results = pd.read_csv(self.args.results + '/results_train.csv', index_col=None)
+            csv_path = self.args.results + '/results_train.csv'
+            if os.path.isfile(csv_path):
+                results = pd.read_csv(csv_path, index_col=None)
+                # Strip old summary block (empty row + mean row appended at end of last save)
+                if len(results) >= 2 and results.iloc[-2].isna().all():
+                    results = results.iloc[:-2].reset_index(drop=True)
             else:
                 results = pd.DataFrame(columns=['L1', 'SSIM', 'PSNR', 'Loss', 'LPIPS', 'N_Splats', 'Allocated_GPU', 'Available_GPU'])
 
             df = pd.DataFrame({'L1':[L1.item()], 'SSIM':[1-SSIM.item()], 'PSNR':[PSNR.item()], 'Loss':[loss.item()], 'LPIPS':[LPIPS.item()], 'N_Splats':[self.gaussians.get_xyz.shape[0]], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
             results = pd.concat([results, df], ignore_index=True)
-            results.to_csv(self.args.results + "/results_train.csv", index=False)
+
+            # Summary: empty row then mean of last 10 data rows (last ~1k iterations)
+            n_summary = min(10, len(results))
+            summary_row = results.iloc[-n_summary:].mean(numeric_only=True).to_frame().T
+            empty_row   = pd.DataFrame([[None] * len(results.columns)], columns=results.columns)
+            full = pd.concat([results, empty_row, summary_row], ignore_index=True)
+            full.to_csv(csv_path, index=False)
 
             name = f'{self.step:06d}'
 
@@ -765,7 +777,7 @@ class SceneTrainer(Trainer):
             
             df = pd.DataFrame({'L1':[L1.item()], 'SSIM':[SSIM.item()], 'PSNR':[PSNR.item()], 'Loss':[loss.item()], 'LPIPS':[LPIPS.item()], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
             results = pd.concat([results, df], ignore_index=True)
-            results.to_csv(self.args.results + "/results_eval.csv", index=False)
+            results.to_csv(self.args.results + "/results_eval.csv", index=False)  # incremental save
 
             name = f'{i:06d}'
 
@@ -787,6 +799,12 @@ class SceneTrainer(Trainer):
             depth_rgb = (cmap(d_norm)[:, :, :3] * 255).astype(np.uint8)
             depth_rgb[~mask] = 0
             Image.fromarray(depth_rgb).save(self.args.results + f"/eval/depth/{name}.png")
+
+        # Append mean summary row after all cameras are evaluated
+        summary_row = results.mean(numeric_only=True).to_frame().T
+        empty_row   = pd.DataFrame([[None] * len(results.columns)], columns=results.columns)
+        final = pd.concat([results, empty_row, summary_row], ignore_index=True)
+        final.to_csv(self.args.results + "/results_eval.csv", index=False)
 
         return results
 
