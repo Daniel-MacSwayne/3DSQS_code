@@ -40,7 +40,7 @@ from time import perf_counter
 
 import warnings
 import pandas as pd
-warnings.filterwarnings('ignore', category=FutureWarning, message='.*DataFrame concatenation.*')
+warnings.filterwarnings('ignore', category=FutureWarning)  # suppress pandas concat dtype warnings
 from PIL import Image
 import matplotlib.pyplot as plt
 import lpips
