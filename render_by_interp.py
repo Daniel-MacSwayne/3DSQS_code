@@ -94,9 +94,12 @@ def images_to_video(image_folder, output_video_path, fps=30):
     h, w = first.shape[:2]
     frameSize = (w, h)
 
-    # Step 3: write all frames
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    Video  = cv2.VideoWriter(output_video_path, fourcc, fps, frameSize)
+    # Step 3: write all frames — try H.264 (widest compatibility) then fall back to mp4v
+    for fourcc_str in ['avc1', 'mp4v']:
+        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+        Video  = cv2.VideoWriter(output_video_path, fourcc, fps, frameSize)
+        if Video.isOpened():
+            break
     for File in Filenames:
         frame = cv2.imread(os.path.join(image_folder, File))
         if frame is not None:

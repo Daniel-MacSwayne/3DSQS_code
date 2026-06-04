@@ -312,13 +312,14 @@ class SceneTrainer(Trainer):
 
         self.scene = Scene(dataset, self.gaussians, opt=args, shuffle=False)                                                                      
 
-        if self.dataset.splat_type == 'GS':
-            self.scene.gaussians._exp12.requires_grad_(False)
-            self.scene.gaussians._exp3.requires_grad_(False)
-        elif self.dataset.splat_type == 'GSE':
-            self.scene.gaussians._exp12.requires_grad_(False)
-        elif self.dataset.splat_type == 'SQ':
-            self.scene.gaussians._exp3.requires_grad_(False)
+        # Freeze ALL shape exponents at start for every splat type.
+        # Extreme e1/e2/e3 gate the gradient signal back to position/scale/colour:
+        #   - box e1/e2 (→0.1): d(d4)/d(xs) = 20*|xs/s1|^19 → near-zero inside, explosive at edges
+        #   - sharp e3 (→5.0): position gradient lives only in a razor-thin boundary rim
+        # Frozen until E3_UNFREEZE_STEP (after densification) so positions converge first.
+        # GS/GSE/SQ always keep their respective freezes beyond that.
+        self.scene.gaussians._exp12.requires_grad_(False)
+        self.scene.gaussians._exp3.requires_grad_(False)
         
         self.gaussians.training_setup(opt)
         if self.checkpoint:
@@ -399,6 +400,19 @@ class SceneTrainer(Trainer):
         if args.optim_pose==False:
             self.gaussians.P.requires_grad_(False)
 
+        # Unfreeze shape exponents once densification has finished and positions are good.
+        # e1/e2 control cross-section shape; e3 controls boundary sharpness.
+        # Both gate gradients back to position/scale, so must be frozen while positions settle.
+        E3_UNFREEZE_STEP = 15000
+        if self.step == E3_UNFREEZE_STEP:
+            splat_type = self.dataset.splat_type
+            if splat_type in ['SQ', 'SQE']:
+                self.gaussians._exp12.requires_grad_(True)
+                print(f'  [step {self.step}] e1/e2 unfrozen (cross-section shape)')
+            if splat_type in ['GSE', 'SQE']:
+                self.gaussians._exp3.requires_grad_(True)
+                print(f'  [step {self.step}] e3 unfrozen (boundary sharpness)')
+
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if self.step % 1000 == 0:
             self.gaussians.oneupSHdegree()
@@ -462,8 +476,19 @@ class SceneTrainer(Trainer):
         SSIM = 1.0 - ssim(image, gt_image)
         PSNR = psnr(image, gt_image)
         LPIPS = lpips_model(image, gt_image)
-                
+
         loss = (1.0 - self.opt.lambda_dssim) * L1 + self.opt.lambda_dssim * SSIM
+
+        # Scale regularisation — penalise effective radius (scale × d4_threshold) above 10% of scene.
+        # Targets large soft splats that escape opacity/size pruning and create "white card" artefacts.
+        with torch.no_grad():
+            _e3  = self.gaussians.get_exp[:, 2].clamp(min=0.1).detach()
+            _thr = torch.pow(torch.tensor(5.5, device=self.device, dtype=self.dtype), 1.0 / _e3)
+        _eff_scale   = self.gaussians.get_scaling.norm(dim=1) * _thr.detach()
+        _max_allowed = 0.1 * self.scene.cameras_extent
+        _excess      = torch.relu(_eff_scale - _max_allowed)
+        L_scale      = _excess.pow(2).mean() * 0.01
+        loss         = loss + L_scale
 
         # with torch.autograd.set_detect_anomaly(True):
         #     # self.accelerator.backward(loss)

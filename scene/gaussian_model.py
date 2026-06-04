@@ -514,7 +514,12 @@ class GaussianModel:
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            # Effective scale = geometric scale × d4 threshold at alpha=1/255 cutoff.
+            # e3=0.9 makes effective radius 6.7× geometric scale — raw scale misses these.
+            _e3 = self.get_exp[:, 2].clamp(min=0.1) if hasattr(self, 'get_exp') else torch.ones(self.get_scaling.shape[0], device=self.get_scaling.device)
+            _thr = torch.pow(torch.tensor(5.5, device=self.get_scaling.device), 1.0 / _e3)
+            _eff = self.get_scaling.norm(dim=1) * _thr
+            big_points_ws = _eff > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
@@ -627,8 +632,8 @@ class GaussianModel2:
     @property
     def get_exp(self):
         exp12 = self.exp_activation(self._exp12) * 1.8 + 0.1
-        exp3 = self.exp_activation(self._exp3) * 4.1 + 0.9
-        # exp3 = self.exp_activation(self._exp3) * 1.8 + 0.1
+        # e3 ∈ [1.0, 5.0] — minimum 1.0 prevents soft halos (e3<1 made effective radius 6.7× geometric scale)
+        exp3 = self.exp_activation(self._exp3) * 4.0 + 1.0
         exp = torch.cat([exp12, exp3], dim=-1)
         return exp
 
@@ -707,7 +712,8 @@ class GaussianModel2:
         exp12 = torch.tensor([[0, 0]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
         # exp12 = torch.tensor([[-1.25276, -1.25276]]).to(dtype=self.dtype, device=device).repeat(fused_point_cloud.shape[0], 1)
         # exp3 = torch.tensor([[-1.466337]]).to(dtype=self.dtype, device=device).repeat(fused_point_cloud.shape[0], 1)
-        exp3 = torch.tensor([[-3.688879454216]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
+        # raw_e3=0 → sigmoid(0)*4.0+1.0 = 3.0 (moderate sharpness, matches new [1.0,5.0] range)
+        exp3 = torch.tensor([[0.0]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
         # self._exp = self.get_exp
 
         # opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1)).to(dtype=self.dtype, device=device))
@@ -988,9 +994,19 @@ class GaussianModel2:
         self._exp12 = optimizable_tensors["exp12"]
         self._exp3 = optimizable_tensors["exp3"]
 
+        n_new  = new_xyz.shape[0]
+        n_old  = self.get_xyz.shape[0] - n_new
+
+        # Preserve max_radii2D for EXISTING splats — only zero the new ones.
+        # Previously this reset all splats to 0, breaking the screen-size pruning.
+        old_radii = self.max_radii2D[:n_old] if self.max_radii2D.shape[0] >= n_old else self.max_radii2D
+        self.max_radii2D = torch.cat([
+            old_radii,
+            torch.zeros(n_new, device=self.device, dtype=self.dtype)
+        ])
+
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self.device)
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -1049,7 +1065,12 @@ class GaussianModel2:
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            # Effective scale = geometric scale × d4 threshold at alpha=1/255 cutoff.
+            # e3=0.9 makes effective radius 6.7× geometric scale — raw scale misses these.
+            _e3 = self.get_exp[:, 2].clamp(min=0.1) if hasattr(self, 'get_exp') else torch.ones(self.get_scaling.shape[0], device=self.get_scaling.device)
+            _thr = torch.pow(torch.tensor(5.5, device=self.get_scaling.device), 1.0 / _e3)
+            _eff = self.get_scaling.norm(dim=1) * _thr
+            big_points_ws = _eff > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
