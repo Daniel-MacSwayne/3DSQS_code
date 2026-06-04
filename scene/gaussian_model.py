@@ -398,12 +398,12 @@ class GaussianModel:
                 stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(orig_grad))
+                group["params"][0] = nn.Parameter(group["params"][0][mask], requires_grad=orig_grad)
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(orig_grad))
+                group["params"][0] = nn.Parameter(group["params"][0][mask], requires_grad=orig_grad)
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
@@ -438,13 +438,13 @@ class GaussianModel:
                 # Forcing True here was overriding the e1/e2/e3 freeze on every densification call.
                 orig_grad = group["params"][0].requires_grad
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(orig_grad))
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0), requires_grad=orig_grad)
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
                 orig_grad = group["params"][0].requires_grad
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(orig_grad))
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0), requires_grad=orig_grad)
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
@@ -928,12 +928,12 @@ class GaussianModel2:
                 stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(orig_grad))
+                group["params"][0] = nn.Parameter(group["params"][0][mask], requires_grad=orig_grad)
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(orig_grad))
+                group["params"][0] = nn.Parameter(group["params"][0][mask], requires_grad=orig_grad)
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
@@ -968,12 +968,12 @@ class GaussianModel2:
                 stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(orig_grad))
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0), requires_grad=orig_grad)
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(orig_grad))
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0), requires_grad=orig_grad)
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
