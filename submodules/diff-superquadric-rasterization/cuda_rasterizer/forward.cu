@@ -19,12 +19,13 @@
 // preprocessCUDA: Per-splat preprocessing kernel.
 //
 // Steps:
-//   1. Frustum cull — skip splats with z <= 0.01 (behind or at camera)
+//   1. Depth cull — skip splats with z <= 0.01 (behind or at camera)
 //   2. Project 3D camera-space centre to 2D pixel coordinates
 //   3. Compute pixel-space bounding radius from scales and exps
-//   4. Determine which tiles the splat overlaps via getRect
-//   5. Build R_cs = R_sc.T (camera-to-shape) from precomposed R_sc and store
-//   6. Write all outputs to global memory arrays
+//   4. Image-space frustum cull — skip if bounding circle misses the image entirely
+//   5. Determine which tiles the splat overlaps via getRect
+//   6. Build R_cs = R_sc.T (camera-to-shape) from precomposed R_sc and store
+//   7. Write all outputs to global memory arrays
 
 __global__ void preprocessCUDA(
     int P,
@@ -52,16 +53,12 @@ __global__ void preprocessCUDA(
     radii_out[idx]       = 0;
     tiles_touched[idx]   = 0;
 
-    // Step 1: frustum cull
+    // Step 1: depth cull — skip splats behind the camera
     float z = means3D[idx * 3 + 2];
     if (z <= 0.01f) return;
 
     float x = means3D[idx * 3 + 0];
     float y = means3D[idx * 3 + 1];
-
-    // Also reject if clearly outside the FOV cone (coarse test)
-    if (fabsf(x / z) > tan_fovx * 1.1f) return;
-    if (fabsf(y / z) > tan_fovy * 1.1f) return;
 
     // Step 2: project to pixel space
     float px = x / z * focal_x + (float)W * 0.5f;
@@ -78,26 +75,35 @@ __global__ void preprocessCUDA(
     //
     // The spatial extent of d4 = threshold maps to scale * 5.5^(1/e3) in world space.
     // In screen space this becomes:  radius = scale_norm * 5.5^(1/e3) / z * f_mean
-    //
-    // Previous formula used scale_norm / clamp(e3,0.5,1) which underestimates by:
-    //   5.5x at e3=1.0,  6x at e3=0.9,  1.4x at e3=5.0 — causing black tile gaps.
     float s0 = scales[idx*3+0], s1 = scales[idx*3+1], s2 = scales[idx*3+2];
     float e3 = exps[idx*3+2];
     float scale_norm = sqrtf(s0*s0 + s1*s1 + s2*s2);
-    // d4 at the alpha=1/255 cutoff boundary
     float threshold_d4 = powf(5.5f, 1.0f / fmaxf(e3, 0.1f));
     int radius = (int)ceilf(scale_norm * threshold_d4 / z * f_mean);
     // Cap at image diagonal to prevent degenerate huge radii from very large splats
     radius = max(1, min(radius, (int)sqrtf((float)(W*W + H*H))));
+
+    // Step 4: image-space frustum cull.
+    //
+    // Reject only if the splat's bounding circle doesn't overlap the image at all.
+    // The old angular test (|x/z| > tan_fov * 1.1) culls splats whose CENTRE is
+    // more than 10% outside the FOV — a margin of only ~27px at typical FOV/res.
+    // Large background splats (radius > 100px) centered just outside that margin
+    // were discarded even though their bodies covered significant portions of the
+    // image, leaving uncovered tiles that rendered as raw background colour and
+    // produced visible grid-aligned holes.
+    if (px + radius < 0.0f || px - radius >= (float)W ||
+        py + radius < 0.0f || py - radius >= (float)H) return;
+
     radii_out[idx] = radius;
 
-    // Step 4: tile overlap count
+    // Step 5: tile overlap count
     uint2 rect_min, rect_max;
     getRect({ px, py }, radius, rect_min, rect_max, grid);
     uint32_t n_tiles = (rect_max.x - rect_min.x) * (rect_max.y - rect_min.y);
     tiles_touched[idx] = n_tiles;
 
-    // Step 5: build R_cs (camera→shape) = R_sc.T
+    // Step 6: build R_cs (camera→shape) = R_sc.T
     //
     //   rotations[] holds R_sc (shape→camera), precomposed in render2() as
     //   quadmultiply(camera_pose, gaussians_rot).  R_cs is its transpose.
@@ -108,7 +114,7 @@ __global__ void preprocessCUDA(
         for (int c = 0; c < 3; c++)
             R_cs[r*3+c] = R_sc[c*3+r];
 
-    // Step 6: write R_cs to global memory (row-major, 9 floats per splat)
+    // Step 7: write R_cs to global memory (row-major, 9 floats per splat)
     for (int i = 0; i < 9; i++) {
         R_cs_out[idx * 9 + i] = R_cs[i];
     }
