@@ -25,13 +25,14 @@
 //   2. Iterate splats from last contributor back to first, in REVERSE
 //   3. For each splat:
 //      a. Cooperative load of splat data into shared memory (same as forward)
-//      b. Recompute camera-plane offset, shape coords, F, G, alpha
+//      b. Recompute camera-plane offset; find rim depth t*; compute q*, F, G, alpha
 //      c. Reconstruct transmittance T at this splat from final_T and alphas (skip trick)
 //      d. Backprop through colour accumulation: dL/d(color), dL/d(alpha)
 //      e. Backprop through alpha = opacity * G: dL/d(opacity), dL/d(G)
 //      f. Backprop through G = exp(-F): dL/d(F)
 //      g. Backprop through superquadricDistance: dL/d(xs,ys,zs), dL/d(s), dL/d(e)
-//      h. Backprop through rotation: dL/d(R_cs) via chain rule
+//      h. Backprop through rotation: dL/d(R_cs) via chain rule using effective offsets
+//         edx=dx+t*xi, edy=dy+t*yi, edz=t* (t* treated as constant)
 //      i. Atomically accumulate all gradients to global memory
 
 __global__ void renderBackwardCUDA(
@@ -165,9 +166,22 @@ __global__ void renderBackwardCUDA(
             const float* R   = &s_R_cs   [j*9];
             const float* sc  = &s_scales  [j*3];
             const float* ex  = &s_exps    [j*3];
-            float xs = R[0]*dx + R[1]*dy;
-            float ys = R[3]*dx + R[4]*dy;
-            float zs = R[6]*dx + R[7]*dy;
+
+            // Recompute rim depth (same as forward — t* not stored, re-derived here)
+#if RIM_ORTHOGRAPHIC
+            float vs[3] = { R[2], R[5], R[8] };
+#else
+            float vs[3] = { R[0]*xi + R[1]*yi + R[2],
+                            R[3]*xi + R[4]*yi + R[5],
+                            R[6]*xi + R[7]*yi + R[8] };
+#endif
+            float q0[3] = { R[0]*dx + R[1]*dy,
+                            R[3]*dx + R[4]*dy,
+                            R[6]*dx + R[7]*dy };
+            float t_star = findRimDepth(q0, vs, sc, ex);
+            float xs = q0[0] + vs[0] * t_star;
+            float ys = q0[1] + vs[1] * t_star;
+            float zs = q0[2] + vs[2] * t_star;
 
             float F     = superquadricDistance(xs, ys, zs, sc, ex);
             float G     = expf(-F);
@@ -230,26 +244,35 @@ __global__ void renderBackwardCUDA(
                 atomicAdd(&dL_dexps  [sidx*3+k], dL_de[k]);
             }
 
-            // Step 3h: backprop through shape coords
-            //   xs = R[0]*dx + R[1]*dy, ys = R[3]*dx + R[4]*dy, zs = R[6]*dx + R[7]*dy
-            //   dL/d(R[0]) = dL/d(xs) * dx,  dL/d(R[1]) = dL/d(xs) * dy, etc.
-            //   dL/d(dx) = R[0]*dL/d(xs) + R[3]*dL/d(ys) + R[6]*dL/d(zs)
-            //   dL/d(dy) = R[1]*dL/d(xs) + R[4]*dL/d(ys) + R[7]*dL/d(zs)
+            // Step 3h: backprop through shape coords.
+            //
+            //   q* = R_cs @ [edx, edy, edz]  where edx = dx + t*·xi,
+            //                                      edy = dy + t*·yi,
+            //                                      edz = t*
+            //   (t* treated as constant — implicit function approximation)
+            //
+            //   dL/d(R_cs[i,j]) = dL/dq*[i] * [edx, edy, edz][j]
+            //
+            //   dL/d(dx) uses R_cs column 0 only (d(q*)/d(dx) = R_cs[:,0]):
+            //   dL/d(dx) = R[0]*dL/dxs + R[3]*dL/dys + R[6]*dL/dzs  — unchanged
+            //   dL/d(dy) = R[1]*dL/dxs + R[4]*dL/dys + R[7]*dL/dzs  — unchanged
             float dL_dxs = dL_dxyz[0], dL_dys = dL_dxyz[1], dL_dzs = dL_dxyz[2];
 
-            // Accumulate dL/d(R_cs) — 9 elements
-            // R[0] = R_cs[0,0]: dL/dR[0] = dL_dxs * dx
+            // Effective camera-space offsets for R_cs gradient
+            float edx = dx + xi * t_star;
+            float edy = dy + yi * t_star;
+            float edz = t_star;   // non-zero: fixes the zero-gradient-for-z-rotation problem
+
+            // All 9 elements of dL/d(R_cs) are now active
             float dL_dRcs[9] = {
-                dL_dxs*dx, dL_dxs*dy, 0.0f,
-                dL_dys*dx, dL_dys*dy, 0.0f,
-                dL_dzs*dx, dL_dzs*dy, 0.0f
+                dL_dxs*edx, dL_dxs*edy, dL_dxs*edz,
+                dL_dys*edx, dL_dys*edy, dL_dys*edz,
+                dL_dzs*edx, dL_dzs*edy, dL_dzs*edz
             };
             for (int k = 0; k < 9; k++)
                 atomicAdd(&dL_dR_cs[sidx*9+k], dL_dRcs[k]);
 
-            // Backprop through dx, dy to means2D
-            // dx = (xi - splat_cam_x) * d = (xi - (mx-cx)/focal_x) * d
-            // dL/d(mx) = -d/focal_x * dL/d(dx) ...
+            // Backprop through dx, dy to means2D (unchanged — t* is constant)
             float dL_ddx = R[0]*dL_dxs + R[3]*dL_dys + R[6]*dL_dzs;
             float dL_ddy = R[1]*dL_dxs + R[4]*dL_dys + R[7]*dL_dzs;
             // dL/d(mx) = -d/focal_x * dL_ddx (mx enters via splat_cam_x)
@@ -271,15 +294,14 @@ __global__ void renderBackwardCUDA(
 
 // preprocessBackwardCUDA: Backprop dL/d(R_cs) to dL/d(quaternion).
 //
-// R_cs = R_ws @ R_cw
-// dL/d(R_ws) = dL/d(R_cs) @ R_cw^T
-// Then backprop through R_ws = quatToMatrix(q) to get dL/dq.
+// Forward: R_cs = R_sc.T  (R_sc = quatToMatrix(rotations[]))
+// Backward: dL/d(R_sc)[i,j] = dL/d(R_cs)[j,i]  (gradient transposes through a matrix transpose)
+// Then backprop through R_sc = quatToMatrix(q) to get dL/dq.
 //
 // Steps:
-//   1. Load R_cw from viewmatrix
-//   2. Compute dL/d(R_ws) = dL/d(R_cs) @ R_cw^T
-//   3. Backprop through quatToMatrix to get dL/dq (Jacobian of rotation matrix w.r.t. quaternion)
-//   4. Write dL/drotations
+//   1. Compute dL/d(R_sc) = (dL/d(R_cs))^T
+//   2. Backprop through quatToMatrix to get dL/dq (Jacobian of rotation matrix w.r.t. quaternion)
+//   3. Write dL/drotations
 
 __global__ void preprocessBackwardCUDA(
     int P,
@@ -291,66 +313,55 @@ __global__ void preprocessBackwardCUDA(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= P) return;
 
-    // Step 1: load R_cw (upper-left 3x3 of viewmatrix, column-major)
-    float R_cw[9];
-    R_cw[0] = viewmatrix[0]; R_cw[1] = viewmatrix[4]; R_cw[2] = viewmatrix[8];
-    R_cw[3] = viewmatrix[1]; R_cw[4] = viewmatrix[5]; R_cw[5] = viewmatrix[9];
-    R_cw[6] = viewmatrix[2]; R_cw[7] = viewmatrix[6]; R_cw[8] = viewmatrix[10];
-
-    // Step 2: dL/d(R_ws) = dL/d(R_cs) @ R_cw^T
+    // Step 1: dL/d(R_sc)[i,j] = dL/d(R_cs)[j,i]
     const float* dL_dRcs = &dL_dR_cs[idx * 9];
-    float dL_dRws[9] = {0};
-    for (int i = 0; i < 3; i++) {
-        for (int j = 0; j < 3; j++) {
-            for (int k = 0; k < 3; k++) {
-                // dL_dRws[i,j] += dL_dRcs[i,k] * R_cw[j,k]  (R_cw^T[k,j] = R_cw[j,k])
-                dL_dRws[i*3+j] += dL_dRcs[i*3+k] * R_cw[j*3+k];
-            }
-        }
-    }
+    float dL_dRsc[9];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            dL_dRsc[i*3+j] = dL_dRcs[j*3+i];
 
-    // Step 3: backprop through R_ws = quatToMatrix(q1,q2,q3,q4)
-    //   R_ws[0,0] = 1 - 2*(q2^2+q3^2)    dR00/dq2 = -4*q2, dR00/dq3 = -4*q3
-    //   R_ws[0,1] = 2*(q1*q2 - q3*q4)    dR01/dq1 = 2*q2, dR01/dq2 = 2*q1, ...
+    // Step 2: backprop through R_sc = quatToMatrix(q1,q2,q3,q4)
+    //   R_sc[0,0] = 1 - 2*(q2^2+q3^2)    dR00/dq2 = -4*q2, dR00/dq3 = -4*q3
+    //   R_sc[0,1] = 2*(q1*q2 - q3*q4)    dR01/dq1 = 2*q2, dR01/dq2 = 2*q1, ...
     //   (full Jacobian — 9 elements x 4 quaternion components)
     float q1 = rotations[idx*4+0], q2 = rotations[idx*4+1];
     float q3 = rotations[idx*4+2], q4 = rotations[idx*4+3];
 
-    // dL/dq = sum_{i,j} dL/dR_ws[i,j] * dR_ws[i,j]/dq
+    // dL/dq = sum_{i,j} dL/dR_sc[i,j] * dR_sc[i,j]/dq
     // Using the standard quaternion Jacobian (derived by differentiating quatToMatrix):
     float dq1 = 0, dq2 = 0, dq3 = 0, dq4 = 0;
 
     // Row 0: R[0]= 1-2(q2²+q3²), R[1]=2(q1q2-q3q4), R[2]=2(q1q3+q2q4)
-    dq2 += dL_dRws[0] * (-4*q2);
-    dq3 += dL_dRws[0] * (-4*q3);
+    dq2 += dL_dRsc[0] * (-4*q2);
+    dq3 += dL_dRsc[0] * (-4*q3);
 
-    dq1 += dL_dRws[1] * (2*q2);  dq2 += dL_dRws[1] * (2*q1);
-    dq3 += dL_dRws[1] * (-2*q4); dq4 += dL_dRws[1] * (-2*q3);
+    dq1 += dL_dRsc[1] * (2*q2);  dq2 += dL_dRsc[1] * (2*q1);
+    dq3 += dL_dRsc[1] * (-2*q4); dq4 += dL_dRsc[1] * (-2*q3);
 
-    dq1 += dL_dRws[2] * (2*q3);  dq2 += dL_dRws[2] * (2*q4);
-    dq3 += dL_dRws[2] * (2*q1);  dq4 += dL_dRws[2] * (2*q2);
+    dq1 += dL_dRsc[2] * (2*q3);  dq2 += dL_dRsc[2] * (2*q4);
+    dq3 += dL_dRsc[2] * (2*q1);  dq4 += dL_dRsc[2] * (2*q2);
 
     // Row 1: R[3]=2(q1q2+q3q4), R[4]=1-2(q1²+q3²), R[5]=2(q2q3-q1q4)
-    dq1 += dL_dRws[3] * (2*q2);  dq2 += dL_dRws[3] * (2*q1);
-    dq3 += dL_dRws[3] * (2*q4);  dq4 += dL_dRws[3] * (2*q3);
+    dq1 += dL_dRsc[3] * (2*q2);  dq2 += dL_dRsc[3] * (2*q1);
+    dq3 += dL_dRsc[3] * (2*q4);  dq4 += dL_dRsc[3] * (2*q3);
 
-    dq1 += dL_dRws[4] * (-4*q1);
-    dq3 += dL_dRws[4] * (-4*q3);
+    dq1 += dL_dRsc[4] * (-4*q1);
+    dq3 += dL_dRsc[4] * (-4*q3);
 
-    dq1 += dL_dRws[5] * (-2*q4); dq2 += dL_dRws[5] * (2*q3);
-    dq3 += dL_dRws[5] * (2*q2);  dq4 += dL_dRws[5] * (-2*q1);
+    dq1 += dL_dRsc[5] * (-2*q4); dq2 += dL_dRsc[5] * (2*q3);
+    dq3 += dL_dRsc[5] * (2*q2);  dq4 += dL_dRsc[5] * (-2*q1);
 
     // Row 2: R[6]=2(q1q3-q2q4), R[7]=2(q2q3+q1q4), R[8]=1-2(q1²+q2²)
-    dq1 += dL_dRws[6] * (2*q3);  dq2 += dL_dRws[6] * (-2*q4);
-    dq3 += dL_dRws[6] * (2*q1);  dq4 += dL_dRws[6] * (-2*q2);
+    dq1 += dL_dRsc[6] * (2*q3);  dq2 += dL_dRsc[6] * (-2*q4);
+    dq3 += dL_dRsc[6] * (2*q1);  dq4 += dL_dRsc[6] * (-2*q2);
 
-    dq1 += dL_dRws[7] * (2*q4);  dq2 += dL_dRws[7] * (2*q3);
-    dq3 += dL_dRws[7] * (2*q2);  dq4 += dL_dRws[7] * (2*q1);
+    dq1 += dL_dRsc[7] * (2*q4);  dq2 += dL_dRsc[7] * (2*q3);
+    dq3 += dL_dRsc[7] * (2*q2);  dq4 += dL_dRsc[7] * (2*q1);
 
-    dq1 += dL_dRws[8] * (-4*q1);
-    dq2 += dL_dRws[8] * (-4*q2);
+    dq1 += dL_dRsc[8] * (-4*q1);
+    dq2 += dL_dRsc[8] * (-4*q2);
 
-    // Step 4: write
+    // Step 3: write
     dL_drotations[idx*4+0] = dq1;
     dL_drotations[idx*4+1] = dq2;
     dL_drotations[idx*4+2] = dq3;

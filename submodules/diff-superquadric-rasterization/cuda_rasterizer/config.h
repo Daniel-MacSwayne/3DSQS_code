@@ -16,3 +16,17 @@
 
 // Number of CUDA warps per block (32 threads per warp)
 #define NUM_WARPS (BLOCK_SIZE / 32)
+
+// RIM_ORTHOGRAPHIC: controls the viewing direction used for rim-depth estimation.
+//
+//   1 (orthographic): vs = R_cs[:,2]  — all pixels share the same camera z-axis
+//     direction.  Matches the Python rim formula exactly; produces correct
+//     silhouette shapes (e.g. hexagonal shadow for a cube on its space diagonal)
+//     regardless of splat distance or field of view.
+//
+//   0 (perspective): vs = R_cs @ [xi, yi, 1]  — each pixel uses its own ray
+//     direction.  Physically more accurate for large splats or wide FOV, but
+//     diverges from the Python rim approach and can distort sharp shapes.
+//
+// Recommendation: use 1 (orthographic) to match the Python renderer.
+#define RIM_ORTHOGRAPHIC 1

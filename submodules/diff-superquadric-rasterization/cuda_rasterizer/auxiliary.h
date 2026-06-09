@@ -1,9 +1,10 @@
 // auxiliary.h: Device helper functions for the superquadric rasterizer.
 //
 // Contains:
-//   - General geometry helpers  (getRect, ndc2Pix, transformPoint)
+//   - General geometry helpers  (getRect, ndc2Pix, transformPoint4x3/4x4)
 //   - Superquadric math         (dabsPow, superquadricDistance, superquadricDistanceGrad)
-//   - Rotation helpers          (quatToMatrix)
+//   - Rotation helpers          (quatToMatrix, matMul3x3, matvec3x3)
+//   - Rim-depth estimation      (superquadricNormal, evalRimH, findRimDepth)
 //   - Debug macro               (CHECK_CUDA)
 
 #pragma once
@@ -344,4 +345,100 @@ __device__ inline float3 matvec3x3(const float* M, float dx, float dy, float dz)
         M[3]*dx + M[4]*dy + M[5]*dz,
         M[6]*dx + M[7]*dy + M[8]*dz
     };
+}
+
+
+// ============================================================
+//  Rim-depth estimation
+// ============================================================
+
+// superquadricNormal: Unit surface normal via direct Cartesian formula (no e3).
+//
+// e3 only scales F, not the gradient direction, so n_hat = ∇d4/|∇d4| where
+// d4 = lat^(e2/e1) + |z/s3|^(2/e1) and lat = |x/s1|^(2/e2) + |y/s2|^(2/e2).
+//
+// Cartesian normal (Barr 1981):
+//   g_x = (1/s1)·|x/s1|^(2/e2−1)·sign(x)·lat^(e2/e1−1)
+//   g_y = (1/s2)·|y/s2|^(2/e2−1)·sign(y)·lat^(e2/e1−1)
+//   g_z = (1/s3)·|z/s3|^(2/e1−1)·sign(z)
+//   n_hat = g / |g|
+//
+// All base values clamped to eps before raising to fractional/negative powers.
+__device__ __forceinline__ void superquadricNormal(
+    float xs, float ys, float zs,
+    const float* __restrict__ s,
+    const float* __restrict__ e,
+    float* __restrict__ n_hat)
+{
+    const float eps = 1e-8f;
+    float alpha = 2.0f / e[1];           // 2/e2
+    float beta  = e[1] / e[0];           // e2/e1
+    float gamma = 2.0f / e[0];           // 2/e1
+
+    float aux = fmaxf(fabsf(xs / s[0]), eps);
+    float auy = fmaxf(fabsf(ys / s[1]), eps);
+    float auz = fmaxf(fabsf(zs / s[2]), eps);
+    float sx = (xs >= 0.0f) ? 1.0f : -1.0f;
+    float sy = (ys >= 0.0f) ? 1.0f : -1.0f;
+    float sz = (zs >= 0.0f) ? 1.0f : -1.0f;
+
+    float lat    = fmaxf(powf(aux, alpha) + powf(auy, alpha), eps);
+    float lat_b1 = powf(lat, beta - 1.0f);
+
+    float gx = beta * lat_b1 * alpha * powf(aux, alpha - 1.0f) / s[0] * sx;
+    float gy = beta * lat_b1 * alpha * powf(auy, alpha - 1.0f) / s[1] * sy;
+    float gz = gamma * powf(auz, gamma - 1.0f) / s[2] * sz;
+
+    float inv = 1.0f / fmaxf(sqrtf(gx*gx + gy*gy + gz*gz), eps);
+    n_hat[0] = gx * inv;
+    n_hat[1] = gy * inv;
+    n_hat[2] = gz * inv;
+}
+
+// evalRimH: h(t) = n̂(q0 + t·vs) · vs  — the rim condition (= 0 at the silhouette).
+//
+// For a convex superquadric, h is monotone along any ray with direction vs, so
+// a bracketed root-finder (Regula Falsi) is guaranteed to converge.
+__device__ __forceinline__ float evalRimH(
+    float xs, float ys, float zs,
+    const float* __restrict__ vs,
+    const float* __restrict__ sc,
+    const float* __restrict__ ex)
+{
+    float n[3];
+    superquadricNormal(xs, ys, zs, sc, ex, n);
+    return n[0]*vs[0] + n[1]*vs[1] + n[2]*vs[2];
+}
+
+// findRimDepth: false-position (Regula Falsi) to find t* where n̂(q0+t*·vs)·vs = 0.
+//
+// Steps:
+//   1. Bracket root in [−2R, +2R] where R = max(scales).  Because q0 lies in the
+//      plane orthogonal to vs, the z-component of q0 + t·vs equals t exactly, so
+//      ±2R always falls outside the shape and h(±2R) ≈ ±1.
+//   2. If h doesn't change sign, the ray hits a flat face — no rim exists; return 0.
+//   3. Iterate with false position: mid = lo − h_lo·(hi−lo)/(h_hi−h_lo).
+//      Converges faster than bisection (superlinear for smooth h) with no derivative.
+__device__ __forceinline__ float findRimDepth(
+    const float* __restrict__ q0,
+    const float* __restrict__ vs,
+    const float* __restrict__ sc,
+    const float* __restrict__ ex)
+{
+    const float R  = fmaxf(sc[0], fmaxf(sc[1], sc[2]));
+    float lo = -2.0f * R,  hi = 2.0f * R;
+
+    float h_lo = evalRimH(q0[0]+vs[0]*lo, q0[1]+vs[1]*lo, q0[2]+vs[2]*lo, vs, sc, ex);
+    float h_hi = evalRimH(q0[0]+vs[0]*hi, q0[1]+vs[1]*hi, q0[2]+vs[2]*hi, vs, sc, ex);
+
+    if (h_lo * h_hi > 0.0f) return 0.0f;   // no sign change — flat face, no rim
+
+    for (int i = 0; i < 16; i++) {
+        float mid   = lo - h_lo * (hi - lo) / (h_hi - h_lo);
+        float h_mid = evalRimH(q0[0]+vs[0]*mid, q0[1]+vs[1]*mid, q0[2]+vs[2]*mid, vs, sc, ex);
+        if (fabsf(h_mid) < 1e-6f) return mid;
+        if (h_lo * h_mid <= 0.0f) { hi = mid; h_hi = h_mid; }
+        else                       { lo = mid; h_lo = h_mid; }
+    }
+    return 0.5f * (lo + hi);
 }

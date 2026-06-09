@@ -23,7 +23,7 @@
 //   2. Project 3D camera-space centre to 2D pixel coordinates
 //   3. Compute pixel-space bounding radius from scales and exps
 //   4. Determine which tiles the splat overlaps via getRect
-//   5. Build R_cs = R_ws @ R_cw (shape-to-camera rotation) and store
+//   5. Build R_cs = R_sc.T (camera-to-shape) from precomposed R_sc and store
 //   6. Write all outputs to global memory arrays
 
 __global__ void preprocessCUDA(
@@ -97,28 +97,16 @@ __global__ void preprocessCUDA(
     uint32_t n_tiles = (rect_max.x - rect_min.x) * (rect_max.y - rect_min.y);
     tiles_touched[idx] = n_tiles;
 
-    // Step 5: build R_cs = R_ws @ R_cw
+    // Step 5: build R_cs (camera→shape) = R_sc.T
     //
-    //   R_ws is the rotation that takes world vectors to shape-local vectors.
-    //   Built from the splat's quaternion via quatToMatrix.
-    //
-    //   R_cw is the upper-left 3x3 of viewmatrix (camera-to-world rotation,
-    //   since world_view_transform is stored transposed from the OpenGL convention).
-    //   We need R_cw here because:
-    //     camera_vec → world_vec: v_w = R_cw @ v_c
-    //     world_vec → shape_vec:  v_s = R_ws @ v_w
-    //   Combined: v_s = R_ws @ R_cw @ v_c = R_cs @ v_c
-    float R_ws[9], R_cs[9];
-    quatToMatrix(&rotations[idx * 4], R_ws);
+    //   rotations[] holds R_sc (shape→camera), precomposed in render2() as
+    //   quadmultiply(camera_pose, gaussians_rot).  R_cs is its transpose.
+    float R_sc[9], R_cs[9];
+    quatToMatrix(&rotations[idx * 4], R_sc);
 
-    // R_cw from viewmatrix upper-left 3x3 (column-major stored, row 0-2, col 0-2)
-    // viewmatrix layout (column-major, 4x4): element [row][col] = viewmatrix[col*4 + row]
-    float R_cw[9];
-    R_cw[0] = viewmatrix[0]; R_cw[1] = viewmatrix[4]; R_cw[2] = viewmatrix[8];
-    R_cw[3] = viewmatrix[1]; R_cw[4] = viewmatrix[5]; R_cw[5] = viewmatrix[9];
-    R_cw[6] = viewmatrix[2]; R_cw[7] = viewmatrix[6]; R_cw[8] = viewmatrix[10];
-
-    matMul3x3(R_ws, R_cw, R_cs);
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            R_cs[r*3+c] = R_sc[c*3+r];
 
     // Step 6: write R_cs to global memory (row-major, 9 floats per splat)
     for (int i = 0; i < 9; i++) {
@@ -142,13 +130,14 @@ __global__ void preprocessCUDA(
 //   3. For each batch of BLOCK_SIZE splats in the tile:
 //      a. Cooperative load: each thread fetches one splat's data into shared mem
 //      b. For each splat in the shared batch:
-//         i.  Compute camera-plane pixel offset from splat centre at splat depth
-//         ii. Rotate [dx, dy, 0] into shape-local frame via R_cs (depth-plane approx)
-//         iii.Evaluate superquadricDistance in shape frame → F
-//         iv. Gaussian weight G = exp(-F)
-//         v.  Compute alpha = min(0.99, opacity * G); skip if negligible
-//         vi. Accumulate colour and depth contributions; update transmittance T
-//         vii.Record last contributor index for backward pass
+//         i.   Compute camera-plane pixel offset from splat centre at splat depth
+//         ii.  Find rim depth t* via Regula Falsi on h(t)=n̂(q0+t·v_s)·v_s=0;
+//              evaluate distance at the corrected shape-space point q*=q0+t*·v_s
+//         iii. Evaluate superquadricDistance in shape frame → F
+//         iv.  Gaussian weight G = exp(-F)
+//         v.   Compute alpha = min(0.99, opacity * G); skip if negligible
+//         vi.  Accumulate colour and depth contributions; update transmittance T
+//         vii. Record last contributor index for backward pass
 //         viii.Early exit if T < 1e-4 (pixel fully saturated)
 //   4. Write final colour + depth + auxiliary data to global memory
 
@@ -252,15 +241,41 @@ __global__ void renderCUDA(
             float dy = (yi - splat_cam_y) * d;
             // dz = 0 (depth-plane approximation)
 
-            // Step 3b-ii: rotate [dx, dy, 0] into shape-local frame
-            const float* R = &s_R_cs[j * 9];
-            float xs = R[0]*dx + R[1]*dy;   // R[2]*0 = 0
-            float ys = R[3]*dx + R[4]*dy;
-            float zs = R[6]*dx + R[7]*dy;
+            // Step 3b-ii: find rim depth t* and evaluate at the corrected 3D point.
+            //
+            //   v_s = R_cs[:,2]  (orthographic: camera z-axis in shape space)
+            //   q0  = R_cs @ [dx, dy, 0]           depth-plane base point in shape space
+            //   t*  = Regula Falsi root of h(t)=0  where h(t) = n̂(q0+t·v_s)·v_s
+            //   q*  = q0 + t*·v_s                  rim surface point in shape space
+            //
+            // h(t) = 0 is the rim condition: the surface normal is perpendicular to
+            // the viewing direction.  For a convex superquadric h is monotone along
+            // any ray, so Regula Falsi always converges from the bracket [−2R, +2R].
+            // Flat-face pixels (h never changes sign) return t*=0 (depth-plane fallback).
+            const float* R  = &s_R_cs  [j * 9];
+            const float* sc = &s_scales[j * 3];
+            const float* ex = &s_exps  [j * 3];
+
+#if RIM_ORTHOGRAPHIC
+            // Orthographic: all pixels share the camera z-axis direction in shape space.
+            // vs = R_cs[:,2]  (third column) — constant per splat, matches Python rim.
+            float vs[3] = { R[2], R[5], R[8] };
+#else
+            // Perspective: each pixel uses its own ray direction.
+            float vs[3] = { R[0]*xi + R[1]*yi + R[2],
+                            R[3]*xi + R[4]*yi + R[5],
+                            R[6]*xi + R[7]*yi + R[8] };
+#endif
+            float q0[3] = { R[0]*dx + R[1]*dy,
+                            R[3]*dx + R[4]*dy,
+                            R[6]*dx + R[7]*dy };
+
+            float t_star = findRimDepth(q0, vs, sc, ex);
+            float xs = q0[0] + vs[0] * t_star;
+            float ys = q0[1] + vs[1] * t_star;
+            float zs = q0[2] + vs[2] * t_star;
 
             // Step 3b-iii: evaluate superquadric distance
-            const float* sc = &s_scales[j*3];
-            const float* ex = &s_exps  [j*3];
             float F = superquadricDistance(xs, ys, zs, sc, ex);
 
             // Step 3b-iv: Gaussian weight
