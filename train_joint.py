@@ -26,7 +26,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.cameras import Camera
 from utils.graphics_utils import getWorld2View2_torch
-from utils.pose_utils import get_camera_from_tensor
+from utils.pose_utils import get_camera_from_tensor, get_tensor_from_camera
 from utils.camera_utils import generate_interpolated_path
 from utils.camera_utils import visualizer
 import torchvision
@@ -66,17 +66,10 @@ def print_memory_usage():
 
 def save_pose(path, quat_pose, train_cams, llffhold=2):
     output_poses=[]
-    index_colmap = [cam.colmap_id for cam in train_cams]
     for quat_t in quat_pose:
         w2c = get_camera_from_tensor(quat_t)
         output_poses.append(w2c)
-    colmap_poses = []
-    for i in range(len(index_colmap)):
-        ind = index_colmap.index(i+1)
-        bb=output_poses[ind]
-        bb = bb#.inverse()
-        colmap_poses.append(bb)
-    colmap_poses = torch.stack(colmap_poses).detach().cpu().numpy()
+    colmap_poses = torch.stack(output_poses).detach().cpu().numpy()
     np.save(path, colmap_poses)
 
 
@@ -90,6 +83,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
     train_cams_init = scene.getTrainCameras().copy()
+    if train_cams_init:
+        c = train_cams_init[0]
+        print(f"Image size: {c.image_width}×{c.image_height}  ({len(train_cams_init)} train cameras)")
     os.makedirs(scene.model_path + '/pose', exist_ok=True)
     save_pose(scene.model_path + '/pose' + "/pose_org.npy", gaussians.P, train_cams_init)
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -326,9 +322,12 @@ class SceneTrainer(Trainer):
         self.gaussians.training_setup(opt)
         if self.checkpoint:
             (model_params, first_iter) = torch.load(self.checkpoint)
-            self.gaussians.restore(model_params, self.opt)        
+            self.gaussians.restore(model_params, self.opt)
 
         self.train_cams_init = self.scene.getTrainCameras().copy()
+        if self.train_cams_init:
+            c = self.train_cams_init[0]
+            print(f"Image size: {c.image_width}×{c.image_height}  ({len(self.train_cams_init)} train cameras)")
         os.makedirs(self.scene.model_path + '/pose', exist_ok=True)
         save_pose(self.scene.model_path + '/pose' + "/pose_org.npy", self.gaussians.P, self.train_cams_init)
         bg_color = [1, 1, 1] if self.dataset.white_background else [0, 0, 0]
@@ -354,9 +353,19 @@ class SceneTrainer(Trainer):
             self.gaussians.load_ply(self.args.results + '/model.ply')
             self.step = args.step
         else:
-            csv_path = self.args.results + '/results_train.csv'
+            csv_path = self.args.results + '/train.csv'
             if os.path.isfile(csv_path):
                 os.remove(csv_path)
+
+        # If resuming past E3_UNFREEZE_STEP the == check in on_train_step never fires.
+        # Re-apply the unfreeze now that self.step is correct.
+        E3_UNFREEZE_STEP = 15000
+        if self.step >= E3_UNFREEZE_STEP:
+            splat_type = self.dataset.splat_type
+            if splat_type in ['SQ', 'SQE']:
+                self.gaussians._exp12.requires_grad_(True)
+            if splat_type in ['GSE', 'SQE']:
+                self.gaussians._exp3.requires_grad_(True)
 
         # total_memory = torch.cuda.get_device_properties(0).total_memory / 2**30
         # allocated_memory = torch.cuda.memory_allocated(0) / 2**30
@@ -481,16 +490,25 @@ class SceneTrainer(Trainer):
 
         loss = (1.0 - self.opt.lambda_dssim) * L1 + self.opt.lambda_dssim * SSIM
 
-        # Scale regularisation — penalise effective radius (scale × d4_threshold) above 10% of scene.
+        # Scale regularisation — penalise effective radius (scale × d4_threshold) above 1× scene extent.
         # Targets large soft splats that escape opacity/size pruning and create "white card" artefacts.
         with torch.no_grad():
-            _e3  = self.gaussians.get_exp[:, 2].clamp(min=0.1).detach()
+            _e3  = self.gaussians.get_exp[:, 2].clamp(min=0.1).detach() if hasattr(self.gaussians, 'get_exp') else torch.ones(self.gaussians.get_scaling.shape[0], device=self.device, dtype=self.dtype)
             _thr = torch.pow(torch.tensor(5.5, device=self.device, dtype=self.dtype), 1.0 / _e3)
         _eff_scale   = self.gaussians.get_scaling.norm(dim=1) * _thr.detach()
-        _max_allowed = 1.0 * self.scene.cameras_extent  # raised from 0.1× to match pruning threshold
+        _max_allowed = 1.0 * self.scene.cameras_extent
         _excess      = torch.relu(_eff_scale - _max_allowed)
         L_scale      = _excess.pow(2).mean() * 0.01
         loss         = loss + L_scale
+
+        # Anisotropy regularisation — penalise splats where one axis is >10× another.
+        # _scaling is in log-space, so log(s_max/s_min) = max(_scaling) - min(_scaling).
+        # Needle-like splats (e.g. 100:1 ratio) cause streak artefacts; 10:1 is a generous cutoff.
+        _log_s        = self.gaussians._scaling                                   # (N, 3)
+        _log_ratio    = _log_s.max(dim=1).values - _log_s.min(dim=1).values      # (N,)
+        _MAX_LOG_RATIO = 2.3026  # log(10) — allow up to 10:1 scale ratio
+        L_aniso       = torch.relu(_log_ratio - _MAX_LOG_RATIO).pow(2).mean() * 0.01
+        loss          = loss + L_aniso
 
         # with torch.autograd.set_detect_anomaly(True):
         #     # self.accelerator.backward(loss)
@@ -603,16 +621,16 @@ class SceneTrainer(Trainer):
         # print("instantsplat_train_time_median: ", np.median(train_time))
 
         if self.step % 100 == 0 or self.step == self.opt.iterations - 1:
-            csv_path = self.args.results + '/results_train.csv'
+            csv_path = self.args.results + '/train.csv'
             if os.path.isfile(csv_path):
                 results = pd.read_csv(csv_path, index_col=None)
                 # Strip old summary block (empty row + mean row appended at end of last save)
                 if len(results) >= 2 and results.iloc[-2].isna().all():
                     results = results.iloc[:-2].reset_index(drop=True)
             else:
-                results = pd.DataFrame(columns=['L1', 'SSIM', 'PSNR', 'Loss', 'LPIPS', 'N_Splats', 'Allocated_GPU', 'Available_GPU'])
+                results = pd.DataFrame(columns=['Iteration', 'L1', 'PSNR', 'SSIM', 'LPIPS', 'Loss', 'N_Splats', 'Allocated_GPU', 'Available_GPU'])
 
-            df = pd.DataFrame({'L1':[L1.item()], 'SSIM':[1-SSIM.item()], 'PSNR':[PSNR.item()], 'Loss':[loss.item()], 'LPIPS':[LPIPS.item()], 'N_Splats':[self.gaussians.get_xyz.shape[0]], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
+            df = pd.DataFrame({'Iteration':[self.step], 'L1':[L1.item()], 'PSNR':[PSNR.item()], 'SSIM':[1-SSIM.item()], 'LPIPS':[LPIPS.item()], 'Loss':[loss.item()], 'N_Splats':[self.gaussians.get_xyz.shape[0]], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
             results = pd.concat([results, df], ignore_index=True)
 
             # Summary: empty row then mean of last 10 data rows (last ~1k iterations)
@@ -719,17 +737,17 @@ class SceneTrainer(Trainer):
         
         # sys.exit()
         
-        results = pd.DataFrame(columns=['L1', 'SSIM', 'PSNR', 'Loss', 'LPIPS', 'Allocated_GPU', 'Available_GPU'])
+        results = pd.DataFrame(columns=['L1', 'PSNR', 'SSIM', 'LPIPS', 'Loss', 'N_Splats', 'Allocated_GPU', 'Available_GPU'])
 
-        # Always evaluate ALL training cameras in order.
-        # The partial-stack bug: on_train_step pops cameras during training, so
-        # self.viewpoint_stack may have as few as 1 camera left when evaluate() runs
-        # (e.g. 30000 mod 19 = 18 consumed → 1 remaining for Aquarium-20).
-        all_cameras = self.scene.getTrainCameras().copy()
+        # Evaluate on held-out test cameras (every 8th image, never seen during training).
+        # Use the camera's original COLMAP pose — test cameras have no entry in the
+        # optimised-pose tensor P, so get_RT() must not be called for them.
+        all_cameras = self.scene.getTestCameras().copy()
 
         for i, viewpoint_cam in enumerate(all_cameras):
-            pose = self.gaussians.get_RT(viewpoint_cam.uid)
-            pose = self.gaussians.get_RT(viewpoint_cam.uid)
+            pose = get_tensor_from_camera(
+                viewpoint_cam.world_view_transform.transpose(0, 1)
+            ).to(dtype=self.dtype, device=self.device)
 
             bg = torch.rand((3), device=self.device) if self.opt.random_background else self.background
 
@@ -775,13 +793,11 @@ class SceneTrainer(Trainer):
             total_memory = torch.cuda.get_device_properties(0).total_memory / 2**30
             allocated_memory = torch.cuda.memory_allocated(0) / 2**30
             reserved_memory = torch.cuda.memory_reserved(0) / 2**30
-            available_memory = total_memory - reserved_memory / 2 **30
-            # print(f"Allocated GPU Memory: {allocated_memory / (1024**3):.2f} GB            ", f"Available (Unallocated) GPU Memory: {available_memory / (1024**3):.2f} GB")
+            available_memory = total_memory - reserved_memory
 
-            
-            df = pd.DataFrame({'L1':[L1.item()], 'SSIM':[SSIM.item()], 'PSNR':[PSNR.item()], 'Loss':[loss.item()], 'LPIPS':[LPIPS.item()], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
+            df = pd.DataFrame({'L1':[L1.item()], 'PSNR':[PSNR.item()], 'SSIM':[(1-SSIM).item()], 'LPIPS':[LPIPS.item()], 'Loss':[loss.item()], 'N_Splats':[self.gaussians.get_xyz.shape[0]], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
             results = pd.concat([results, df], ignore_index=True)
-            results.to_csv(self.args.results + "/results_eval.csv", index=False)  # incremental save
+            results.to_csv(self.args.results + "/test.csv", index=False)  # incremental save
 
             name = f'{i:06d}'
 
@@ -808,7 +824,7 @@ class SceneTrainer(Trainer):
         summary_row = results.mean(numeric_only=True).to_frame().T
         empty_row   = pd.DataFrame([[None] * len(results.columns)], columns=results.columns)
         final = pd.concat([results, empty_row, summary_row], ignore_index=True)
-        final.to_csv(self.args.results + "/results_eval.csv", index=False)
+        final.to_csv(self.args.results + "/test.csv", index=False)
 
         return results
 
@@ -877,7 +893,7 @@ if __name__ == "__main__":
 
 
     
-    trainer.train()
+    # trainer.train()
     trainer.evaluate()
 
 

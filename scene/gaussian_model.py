@@ -637,10 +637,12 @@ class GaussianModel2:
     @property
     def get_exp(self):
         exp12 = self.exp_activation(self._exp12) * 1.8 + 0.1
-        # e3: use full [0.9, 5.0] range so e3=1.0 sits in the MIDDLE (not at saturation boundary),
-        # then clamp to min=1.0. Gradients are healthy throughout; below-1.0 updates are silently
-        # ignored by the clamp rather than vanishing at a sigmoid saturation point.
-        exp3 = torch.clamp(self.exp_activation(self._exp3) * 4.1 + 0.9, min=1.0)
+        # e3: sigmoid(x) + 0.5 maps raw param to [0.5, 1.5].
+        # At init x=0: e3 = sigmoid(0)+0.5 = 1.0, and d(e3)/d(x) = 0.25 — gradient flows freely.
+        # The old formula (sigmoid(x)*4.1+0.9, clamped at min=1.0) placed the init value
+        # just below the clamp threshold (0.9999 < 1.0), so the clamp was always active and
+        # the gradient was permanently zero — e3 never trained at all.
+        exp3 = self.exp_activation(self._exp3) + 0.5
         exp = torch.cat([exp12, exp3], dim=-1)
         return exp
 
@@ -719,11 +721,8 @@ class GaussianModel2:
         exp12 = torch.tensor([[0, 0]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
         # exp12 = torch.tensor([[-1.25276, -1.25276]]).to(dtype=self.dtype, device=device).repeat(fused_point_cloud.shape[0], 1)
         # exp3 = torch.tensor([[-1.466337]]).to(dtype=self.dtype, device=device).repeat(fused_point_cloud.shape[0], 1)
-        # raw_e3=-1.945 → sigmoid(-1.945)*4.0+1.0 = 1.5 (near minimum, avoids gradient death at boundary)
-        # e1=e2=1.0 (sphere) and e3=1.5 (slightly sharp) at init — all close to 1.0 as requested
-        # raw=-3.6889 → sigmoid(-3.6889)*4.1+0.9 = 0.9999 → clamped to exactly 1.0
-        # 1.0 is in the middle of the activation range so gradients are non-zero (~0.10)
-        exp3 = torch.tensor([[-3.6889]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
+        # raw=0 → sigmoid(0)+0.5 = 1.0 (sphere/ellipsoid boundary at init, gradient=0.25)
+        exp3 = torch.zeros((fused_point_cloud.shape[0], 1), dtype=self.dtype, device=self.device)
         # self._exp = self.get_exp
 
         # opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1)).to(dtype=self.dtype, device=device))
