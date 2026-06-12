@@ -6,8 +6,6 @@ import numpy as np
 import argparse
 import time
 
-sys.path = sys.path[:-1]
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.sys.path.append(os.path.abspath(os.path.join(BASE_DIR, "submodules", "dust3r")))
 # os.sys.path.append(os.path.abspath(os.path.join(BASE_DIR, "submodules", "mast3r")))
@@ -74,6 +72,19 @@ if __name__ == '__main__':
     # model = AsymmetricMASt3R.from_pretrained(model_path).to(device)
     ##########################################################################################################################################################################################
 
+    # Output goes to a dust3r/ sibling of the scene base folder,
+    # keeping the COLMAP folder completely untouched.
+    # For Deep_Blending: img_base_path = .../Playroom/colmap/ → scene_root = .../Playroom/
+    # For Mip_nerf_360:  img_base_path = .../bicycle/        → scene_root = .../bicycle/
+    scene_root         = os.path.dirname(img_base_path.rstrip('/'))
+    output_colmap_path = os.path.join(scene_root, "dust3r", "sparse", "0")
+    os.makedirs(output_colmap_path, exist_ok=True)
+
+    # Symlink images/ inside dust3r/ so the scene loader finds them without copying
+    dust3r_images_link = os.path.join(scene_root, "dust3r", "images")
+    if not os.path.exists(dust3r_images_link):
+        os.symlink(img_folder_path, dust3r_images_link)
+
     train_img_list = sorted(os.listdir(img_folder_path))
     assert len(train_img_list)==n_views, f"Number of images ({len(train_img_list)}) in the folder ({img_folder_path}) is not equal to {n_views}"
 
@@ -97,8 +108,6 @@ if __name__ == '__main__':
     # DUST3R
     pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
     output = inference(pairs, model, args.device, batch_size=batch_size)
-    output_colmap_path=img_folder_path.replace("images", "sparse/0")
-    os.makedirs(output_colmap_path, exist_ok=True)
 
     scene = global_aligner(output, device=args.device, mode=GlobalAlignerMode.PointCloudOptimizer)
     loss = compute_global_alignment(scene=scene, init="mst", niter=niter, schedule=schedule, lr=lr, focal_avg=args.focal_avg)
@@ -157,3 +166,5 @@ if __name__ == '__main__':
     pts_4_3dgs_all = np.array(pts3d).reshape(-1, 3)
     np.save(output_colmap_path + "/pts_4_3dgs_all.npy", pts_4_3dgs_all)
     np.save(output_colmap_path + "/focal.npy", np.array(focals.detach().cpu()))
+    print(f"DUSt3R output saved to: {os.path.dirname(os.path.dirname(output_colmap_path))}")
+    print(f"  {len(pts_4_3dgs)} points → dust3r/sparse/0/points3D.ply")

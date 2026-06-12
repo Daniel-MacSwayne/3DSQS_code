@@ -26,72 +26,126 @@ from utils.camera_utils import visualizer
 import cv2
 import numpy as np
 import imageio
+import matplotlib.pyplot as plt
+from PIL import Image as PILImage
 
 
-def save_interpolate_pose(model_path, iter, n_views):
+def save_interpolate_pose(model_path, iter):  # n_views unused — orbit ignores keyframe count
+    # save_interpolate_pose: Generate a smooth circular orbit around the scene.
+    #
+    # Steps:
+    #   1. Load optimised poses and extract camera centres
+    #   2. PCA of camera centres → find the dominant orbit plane (v1, v2) and orbit axis (v3)
+    #   3. Generate exactly 300 poses equally spaced around the orbit circle
+    #   4. For each pose: camera sits at orbit_pos, looks at scene_centre, down ≈ v3
+    #   5. Save W2C pose sequence to pose_interpolated.npy
 
-    # org_pose = np.load(model_path + f"/pose/pose_{iter}.npy")
-    org_pose = np.load(model_path + f"/pose/pose_org.npy")
+    org_pose = np.load(model_path + f"/pose/pose_org.npy")   # (N, 4, 4) W2C
 
-    org_pose = org_pose[[22, 19]]
-    
-    visualizer(org_pose, ["green" for _ in org_pose], model_path + "/pose/poses_optimized.png")
-    # n_interp = int(10 * 30 / n_views)  # 10second, fps=30
-    n_interp = int(10 * 30 / n_views)  # 10second, fps=30
-    all_inter_pose = []
-    for i in range(n_views-1):
-        tmp_inter_pose = generate_interpolated_path(poses=org_pose[i:i+2], n_interp=n_interp)
-        all_inter_pose.append(tmp_inter_pose)
-    all_inter_pose = np.array(all_inter_pose).reshape(-1, 3, 4)
+    # Step 1: extract camera centres from W2C matrices
+    # camera_centre = -R_w2c.T @ T_w2c
+    centers     = np.array([-(p[:3,:3].T @ p[:3,3]) for p in org_pose])
+    scene_ctr   = centers.mean(0)
 
-    inter_pose_list = []
-    for p in all_inter_pose:
-        tmp_view = np.eye(4)
-        tmp_view[:3, :3] = p[:3, :3]
-        tmp_view[:3, 3] = p[:3, 3]
-        inter_pose_list.append(tmp_view)
-    inter_pose = np.stack(inter_pose_list, 0)
-    visualizer(inter_pose, ["blue" for _ in inter_pose], model_path + "/pose/poses_interpolated.png")
+    # Step 2: PCA → orbit plane (v1, v2) + orbit axis (v3)
+    centered    = centers - scene_ctr
+    _, _, Vt    = np.linalg.svd(centered)
+    v1, v2, v3  = Vt[0], Vt[1], Vt[2]
+
+    # Orient v3 to match the average camera "down" direction so images are upright.
+    # In OpenCV convention, camera Y = down in camera space → column 1 of C2W = down in world.
+    R_c2ws      = org_pose[:,:3,:3].transpose(0,2,1)         # C2W rotation (N,3,3)
+    avg_down    = R_c2ws[:,:,1].mean(0)                      # average world "down" direction
+    if np.dot(v3, avg_down) < 0:
+        v3 = -v3                                              # flip to match camera orientation
+
+    # Orbit radius: median distance from scene centre projected onto the orbit plane
+    radius      = np.median(np.linalg.norm(centered @ np.stack([v1, v2], axis=1), axis=1))
+
+    # Step 3: 300 equally-spaced angles
+    N           = 300
+    thetas      = np.linspace(0, 2 * np.pi, N, endpoint=False)
+
+    # Step 4: build W2C matrix for each orbit position
+    orbit_poses = []
+    for theta in thetas:
+        # Camera position on the orbit circle
+        pos     = scene_ctr + radius * (np.cos(theta) * v1 + np.sin(theta) * v2)
+
+        # Camera Z = forward, looking at scene centre
+        cam_z   = scene_ctr - pos
+        cam_z  /= np.linalg.norm(cam_z)
+
+        # Camera Y = "down" in OpenCV convention; use orbit axis v3, projected ⊥ cam_z
+        cam_y   = v3 - np.dot(v3, cam_z) * cam_z
+        cam_y  /= np.linalg.norm(cam_y)
+
+        # Camera X = right = down × forward (right-handed, gives correct handedness)
+        cam_x   = np.cross(cam_y, cam_z)
+        cam_x  /= np.linalg.norm(cam_x)
+
+        # Assemble W2C: R_c2w columns are [right, down, fwd] in world space
+        R_c2w   = np.stack([cam_x, cam_y, cam_z], axis=1)   # (3,3)
+        R_w2c   = R_c2w.T
+        T_w2c   = -R_w2c @ pos
+
+        pose_w2c            = np.eye(4)
+        pose_w2c[:3, :3]    = R_w2c
+        pose_w2c[:3,  3]    = T_w2c
+        orbit_poses.append(pose_w2c)
+
+    inter_pose = np.stack(orbit_poses, 0)                    # (300, 4, 4)
+    # Step 5: save
+    # visualizer(inter_pose, ["blue" for _ in inter_pose], model_path + "/pose/poses_interpolated.png")
     np.save(model_path + "/pose/pose_interpolated.npy", inter_pose)
+    print(f"  Orbit trajectory: {N} poses, radius={radius:.3f}, centre={np.round(scene_ctr,3)}")
 
 
 def images_to_video(image_folder, output_video_path, fps=30):
+    """images_to_video: Compile PNG/JPG frames in a folder into an H.264 MP4.
+
+    Steps:
+      1. Collect and sort image files in image_folder (skip subdirectories)
+      2. Read frames as RGB numpy arrays via cv2
+      3. Write H.264 MP4 via imageio + pyav (libx264)
     """
-    Convert images in a folder to a video.
+    # Step 1: sorted image files only (skip subdirectories like depth/)
+    filenames = sorted([
+        f for f in os.listdir(image_folder)
+        if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+        and os.path.isfile(os.path.join(image_folder, f))
+    ])
+    if not filenames:
+        print(f"[images_to_video] No image files found in {image_folder}")
+        return
 
-    Args:
-    - image_folder (str): The path to the folder containing the images.
-    - output_video_path (str): The path where the output video will be saved.
-    - fps (int): Frames per second for the output video.
-    """
-    images = []
+    # Step 2: load as RGB (imageio expects RGB; cv2 reads BGR)
+    frames = []
+    for f in filenames:
+        img = cv2.imread(os.path.join(image_folder, f))
+        if img is not None:
+            frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
-    # for filename in sorted(os.listdir(image_folder)):
-    #     if filename.endswith(('.png', '.jpg', '.jpeg', '.JPG', '.PNG')):
-    #         image_path = os.path.join(image_folder, filename)
-    #         image = imageio.imread(image_path)
-    #         images.append(image)
+    if not frames:
+        print(f"[images_to_video] Could not read any frames from {image_folder}")
+        return
 
-    # imageio.mimwrite(output_video_path, images, fps=fps)
-
-    import cv2
-    Filenames = sorted(os.listdir(image_folder))
-    # print(image_folder + '/' + Filenames[0])
-    Frame = cv2.imread(image_folder + '/' + Filenames[0], cv2.IMREAD_GRAYSCALE).shape[::-1]
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    Video = cv2.VideoWriter(output_video_path, fourcc, fps=30, frameSize=Frame)
-        
-    for File in Filenames:
-        Video.write(cv2.imread(image_folder + '/' + File))
-            
-    Video.release()
-    return
+    # Step 3: write H.264 MP4 via imageio + pyav
+    imageio.mimsave(output_video_path, frames, fps=fps, codec='libx264')
+    h, w = frames[0].shape[:2]
+    print(f"Video saved: {output_video_path}  ({len(frames)} frames @ {fps}fps  {w}×{h})")
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, args):
-    # render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    render_path = os.path.join(args.results, f"interp/render")
-    depth_path = os.path.join(args.results, f"interp/depth")
+    render_path = os.path.join(args.results, "interp/render")
+    depth_path  = os.path.join(args.results, "interp/depth")
     makedirs(render_path, exist_ok=True)
+    makedirs(depth_path,  exist_ok=True)
+
+    # views is the smooth interpolated path loaded by the scene (get_video=True path).
+    # Clamp to exactly 300 frames so the video is always 10 s at 30 fps.
+    views = views[:300]
+
+    cmap = plt.get_cmap('viridis')
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         camera_pose = get_tensor_from_camera(view.world_view_transform.transpose(0, 1)).to(device='cpu')
@@ -101,17 +155,23 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         elif gaussians.splat_type in ['GSE', 'SQ', 'SQE']:
             render_pkg = render2(view, gaussians, pipeline, background, camera_pose=camera_pose)
         rendering = render_pkg["render"]
-        depth = render_pkg["depth"]
-        
-        # rendering = render(
-            # view, gaussians, pipeline, background, camera_pose=camera_pose
-        # )["render"]
+        depth     = render_pkg["depth"]
 
-        
-        gt = view.original_image[0:3, :, :]
-        torchvision.utils.save_image(
-            rendering, os.path.join(render_path, "{0:05d}".format(idx) + ".png")
-        )
+        torchvision.utils.save_image(rendering, os.path.join(render_path, f"{idx:05d}.png"))
+
+        # Depth — viridis colourmap, yellow=near, purple=far, black=no geometry
+        d_np = depth.squeeze().detach().cpu().numpy()
+        mask = d_np > 0
+        d_norm = np.zeros_like(d_np)
+        if mask.any():
+            lo, hi = d_np[mask].min(), d_np[mask].max()
+            if hi > lo:
+                d_norm[mask] = 1.0 - (d_np[mask] - lo) / (hi - lo)
+            else:
+                d_norm[mask] = 0.5
+        depth_rgb = (cmap(d_norm)[:, :, :3] * 255).astype(np.uint8)
+        depth_rgb[~mask] = 0
+        PILImage.fromarray(depth_rgb).save(os.path.join(depth_path, f"{idx:05d}.png"))
 
 
 def render_sets(
@@ -128,9 +188,8 @@ def render_sets(
     device = args.device
     
     
-    # Applying interpolation
     # save_interpolate_pose(dataset.model_path, iteration, args.n_views)
-    save_interpolate_pose(dataset.model_path, iteration, 2)
+    save_interpolate_pose(dataset.model_path, iteration)
 
     with torch.no_grad():
 
@@ -144,10 +203,7 @@ def render_sets(
 
         scene.gaussians.load_ply(args.results + '/model.ply')
         gaussians.splat_type = dataset.splat_type
-
-        scene.gaussians._exp12 = scene.gaussians._exp12 * 0 + 1
-        scene.gaussians._exp3 = scene.gaussians._exp3 * 0 + -3.688879454216
-        scene.gaussians._xyz += (torch.rand_like(scene.gaussians._xyz) - 0.5)*0.0005
+        # Note: do NOT modify _exp12/_exp3/_xyz here — render the model as-is
         
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -175,13 +231,17 @@ def render_sets(
     )
 
     if args.get_video:
-        # image_folder = os.path.join(args.model_path, f'interp/ours_{args.iteration}/renders')
-        # image_folder = os.path.join(args.model_path, f'interp/ours_None/renders')
-        image_folder = os.path.join(args.results, f'interp/')
-        # print(image_folder)
-        # output_video_file = os.path.join(args.results, f'{args.scene}_{args.n_views}_{args.splat_type}_view.mp4')
-        output_video_file = os.path.join(args.results, f'{args.scene}_{args.n_views}_{args.splat_type}_view.mp4')
-        images_to_video(image_folder, output_video_file, fps=30)
+        stem = f'{args.scene}_{args.splat_type}'
+        images_to_video(
+            os.path.join(args.results, 'interp', 'render'),
+            os.path.join(args.results, f'{stem}_rgb.mp4'),
+            fps=30,
+        )
+        images_to_video(
+            os.path.join(args.results, 'interp', 'depth'),
+            os.path.join(args.results, f'{stem}_depth.mp4'),
+            fps=30,
+        )
 
 
 if __name__ == "__main__":

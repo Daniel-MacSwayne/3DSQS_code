@@ -29,6 +29,17 @@ import gc
 from .Superquadric_Splatting import *
 # from Plotly_Functions import *
 
+# Try to import the CUDA superquadric rasterizer.
+# Falls back to the Python rasterizer3() if the extension is not yet built.
+try:
+    from diff_superquadric_rasterization import (
+        SuperquadricRasterizationSettings,
+        SuperquadricRasterizer,
+    )
+    _CUDA_SQ_AVAILABLE = True
+except ImportError:
+    _CUDA_SQ_AVAILABLE = False
+
 # tc.manual_seed(0)
 # np.random.seed(0)
 tc.autograd.set_detect_anomaly(False)
@@ -98,7 +109,7 @@ def render(
     xyz_ones = tc.ones(gaussians_xyz.shape[0], 1).to(dtype=dtype, device=device)
     xyz_homo = tc.cat((gaussians_xyz, xyz_ones), dim=1)
     gaussians_xyz_trans = (rel_w2c @ xyz_homo.T).T[:, :3]
-    gaussians_rot_trans = quadmultiply(camera_pose[:4], gaussians_rot)
+    rot_sc = quadmultiply(camera_pose[:4], gaussians_rot)       # R_sc: shape→camera
     means3D = gaussians_xyz_trans
     means2D = screenspace_points
     opacity = pc.get_opacity
@@ -112,7 +123,7 @@ def render(
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
         scales = pc.get_scaling
-        rotations = gaussians_rot_trans  # pc.get_rotation
+        rotations = rot_sc
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -200,18 +211,18 @@ def render2(
     xyz_homo = tc.cat((gaussians_xyz, xyz_ones), dim=1)                  # (N, 4)
     means3D = (rel_w2c @ xyz_homo.T).T[:, :3]                   # (N, 3)
     # gaussians_xyz_trans = (rel_w2c @ xyz_homo.T).T[:, :3]                   # (N, 3)
-    gaussians_rot_trans = quadmultiply(camera_pose[:4], gaussians_rot)      # (N, 4)
+    rot_sc = quadmultiply(camera_pose[:4], gaussians_rot)                   # (N, 4) R_sc: shape→camera
     # means3D = gaussians_xyz_trans                                           # (N, 3)
     # means2D = screenspace_points
 
     # print(means3D.max())
     
-    # If points are too near or behind camera, roughly within FOV and not too small.
-    visible1 = means3D[:, 2] > 0.01                                          # (N,)
-    visible2 = tc.abs(means3D[:, 0] / means3D[:, 2]) < tanfovx * 1.05     # (N,)
-    visible3 = tc.abs(means3D[:, 1] / means3D[:, 2]) < tanfovy * 1.05     # (N,)
-    # visible4 = tc.norm(scales, axis=-1) / means3D[:, 2] > min(tanfovx/viewpoint_camera.width, tanfovy/viewpoint_camera.height) / 2
-    visible = visible1 * visible2 * visible3# * visible4                     # (N,)
+    # Depth cull only — the CUDA preprocess kernel handles image-space frustum culling
+    # via a radius-expanded tile-overlap test (matching diff-gaussian-rasterization).
+    # The old centre-based FOV filter (|x/z| < tanfov * 1.05) was equivalent to the
+    # original CUDA frustum cull bug: it dropped large background splats whose centres
+    # were just outside the FOV even when their bodies covered significant image area.
+    visible = means3D[:, 2] > 0.01                                           # (N,)
     # visible[::2] = False
     # visible[20000:] = False
     
@@ -230,7 +241,7 @@ def render2(
         cov3D_precomp = pc.get_covariance(scaling_modifier)[visible]        # (M, 3, 3)
     else:
         scales = pc.get_scaling[visible]                                    # (M, 3)
-        rotations = gaussians_rot_trans[visible]                            # (M, 4)
+        rotations = rot_sc[visible]                                         # (M, 4) R_sc: shape→camera
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -252,19 +263,43 @@ def render2(
 
     # print(rel_w2c.shape, gaussians_xyz.shape, gaussians_rot.shape, visible.shape, means3D.shape, scales.shape, rotations.shape, colors_precomp.shape)
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen).
-    render_color, render_depth, radii = rasterizer3(
-        camera=viewpoint_camera,
-        means3D=means3D,
-        # means2D=means2D,
-        # shs=shs,
-        colors_precomp=colors_precomp,
-        opacity=opacity,
-        scales=scales,
-        rotations=rotations,
-        exps=exp,
-        # cov3D_precomp=cov3D_precomp,
-    )
+    # Rasterize visible splats to image.
+    # Uses the CUDA superquadric rasterizer if built, otherwise falls back to
+    # the Python rasterizer3() implementation.
+    if _CUDA_SQ_AVAILABLE:
+        # CUDA path:
+        #   Steps:
+        #     1. Build rasterization settings from camera intrinsics and viewmatrix
+        #     2. Construct rasterizer module and run forward pass
+        #     3. Unpack (render_color, render_depth, radii)
+        sq_settings = SuperquadricRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height),
+            image_width =int(viewpoint_camera.image_width),
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=bg_color,
+            viewmatrix=viewpoint_camera.world_view_transform.to(dtype=dtype, device=device),
+        )
+        sq_rasterizer = SuperquadricRasterizer(raster_settings=sq_settings)
+        render_color, render_depth, radii = sq_rasterizer(
+            means3D=means3D,
+            colors=colors_precomp,
+            opacity=opacity,
+            scales=scales,
+            rotations=rotations,
+            exps=exp,
+        )
+    else:
+        # Python fallback path (original rasterizer3)
+        render_color, render_depth, radii = rasterizer3(
+            camera=viewpoint_camera,
+            means3D=means3D,
+            colors_precomp=colors_precomp,
+            opacity=opacity,
+            scales=scales,
+            rotations=rotations,
+            exps=exp,
+        )
 
     render_pkg =  {
         "render": render_color,                           # (3, H, W)
@@ -372,14 +407,9 @@ def rasterizer2(camera, means3D, colors_precomp, opacity, scales, rotations, exp
             Xc__ -= sorted_means * I + 1e-10
             # Xc__ -= sorted_means                                                    # (L, T, T, 2)    
 
-            q_ws = rotations[in_mask][index][limit]                                 # (L, 4)
-            R_ws = Construct_(q_ws)                                                 # (L, 3, 3)
-
-            v_cw = camera.world_view_transform.to(dtype=dtype, device=device)       # (4, 4)
-            R_cw = v_cw[:3, :3]                                                     # (3, 3)
-            T_cw = v_cw[:3, 3]                                                      # (3)
-
-            R_cs = R_ws @ R_cw                                                      # (3, 3)
+            q_sc = rotations[in_mask][index][limit]                                 # (L, 4)    R_sc: shape→camera
+            R_sc = Construct_(q_sc)                                                 # (L, 3, 3) R_sc: shape→camera
+            R_cs = R_sc.permute(0, 2, 1)                                            # (L, 3, 3) R_cs: camera→shape = R_sc.T
 
             G__ = Superquadric_Tile_(Xc__, s_=sorted_scales, e_=sorted_exps, R_cs=R_cs, Show=False)     # (L, T, T)
             gauss_weight = G__.reshape(L, -1).T                                     # (T*T, L)
@@ -423,7 +453,7 @@ def rasterizer2(camera, means3D, colors_precomp, opacity, scales, rotations, exp
     }
 
     try:
-        del means3D, means2D, radii, rect, pix_coord, over_tl, over_br, in_mask, sorted_depths, sorted_opacity, sorted_color, sorted_means, sorted_scales, sorted_exps, tile_coord, Xp__, Xi__, Xc__, q_ws, R_ws, v_cw, R_cw, T_cw, R_cs, G__, gauss_weight, alpha, T, acc_alpha, tile_color, tile_depth
+        del means3D, means2D, radii, rect, pix_coord, over_tl, over_br, in_mask, sorted_depths, sorted_opacity, sorted_color, sorted_means, sorted_scales, sorted_exps, tile_coord, Xp__, Xi__, Xc__, q_sc, R_sc, R_cs, G__, gauss_weight, alpha, T, acc_alpha, tile_color, tile_depth
     except: pass
 
 
@@ -476,10 +506,6 @@ def rasterizer3(camera, means3D, colors_precomp, opacity, scales, rotations, exp
     Xi__ = Xp__ / f[0]                                      # (N_h, N_w, h, w, 2)
 
     del pix_coord, Xp__
-
-    v_cw = camera.world_view_transform.to(dtype=dtype, device=device)       # (4, 4)
-    R_cw = v_cw[:3, :3]                                                     # (3, 3)
-    T_cw = v_cw[:3, 3]                                                      # (3)
 
     ###########################################################################
     # Sort Splats by depth
@@ -595,9 +621,9 @@ def rasterizer3(camera, means3D, colors_precomp, opacity, scales, rotations, exp
         D_ = depths[I0][..., None, None]                    # (T, l, 1, 1, 1)
         s_ = scales[I1]                                     # (U, 3)
         e_ = exps[I1]                                       # (U, 3)
-        q_ws = rotations[I1]                                # (U, 4)  
-        R_ws = Construct_(q_ws)                             # (U, 3, 3)
-        R_cs = R_ws @ R_cw                                  # (U, 3, 3)
+        q_sc = rotations[I1]                                # (U, 4)    R_sc: shape→camera
+        R_sc = Construct_(q_sc)                             # (U, 3, 3) R_sc: shape→camera
+        R_cs = R_sc.permute(0, 2, 1)                        # (U, 3, 3) R_cs: camera→shape = R_sc.T
 
         ###########################################################################
         # Adjust Splatting Canvas Coordinates
@@ -646,7 +672,7 @@ def rasterizer3(camera, means3D, colors_precomp, opacity, scales, rotations, exp
         # Update unsaturated tiles mask
         m3[m4] = m2[m4].reshape(T, h*w).any(dim=-1)         # (T,)
 
-        del C__, A__, M_, D_, s_, e_, q_ws, R_ws, R_cs, Xc__, G__, a_acc, alpha, trans
+        del C__, A__, M_, D_, s_, e_, q_sc, R_sc, R_cs, Xc__, G__, a_acc, alpha, trans
     
     # Apply Background Colour (e.g., white) to all remaining transparent regions
     white_bkgd = False

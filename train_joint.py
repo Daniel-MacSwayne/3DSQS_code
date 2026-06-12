@@ -26,7 +26,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.cameras import Camera
 from utils.graphics_utils import getWorld2View2_torch
-from utils.pose_utils import get_camera_from_tensor
+from utils.pose_utils import get_camera_from_tensor, get_tensor_from_camera
 from utils.camera_utils import generate_interpolated_path
 from utils.camera_utils import visualizer
 import torchvision
@@ -38,7 +38,9 @@ except ImportError:
     
 from time import perf_counter
 
+import warnings
 import pandas as pd
+warnings.filterwarnings('ignore', category=FutureWarning)  # suppress pandas concat dtype warnings
 from PIL import Image
 import matplotlib.pyplot as plt
 import lpips
@@ -64,17 +66,10 @@ def print_memory_usage():
 
 def save_pose(path, quat_pose, train_cams, llffhold=2):
     output_poses=[]
-    index_colmap = [cam.colmap_id for cam in train_cams]
     for quat_t in quat_pose:
         w2c = get_camera_from_tensor(quat_t)
         output_poses.append(w2c)
-    colmap_poses = []
-    for i in range(len(index_colmap)):
-        ind = index_colmap.index(i+1)
-        bb=output_poses[ind]
-        bb = bb#.inverse()
-        colmap_poses.append(bb)
-    colmap_poses = torch.stack(colmap_poses).detach().cpu().numpy()
+    colmap_poses = torch.stack(output_poses).detach().cpu().numpy()
     np.save(path, colmap_poses)
 
 
@@ -88,6 +83,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
     train_cams_init = scene.getTrainCameras().copy()
+    if train_cams_init:
+        c = train_cams_init[0]
+        print(f"Image size: {c.image_width}×{c.image_height}  ({len(train_cams_init)} train cameras)")
     os.makedirs(scene.model_path + '/pose', exist_ok=True)
     save_pose(scene.model_path + '/pose' + "/pose_org.npy", gaussians.P, train_cams_init)
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -221,12 +219,8 @@ def prepare_output_and_logger(args):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
+    # TensorBoard writer disabled — event files clutter the results folder
     tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
     return tb_writer
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
@@ -292,32 +286,48 @@ class SceneTrainer(Trainer):
         self.device = args.device
     
         first_iter = 0
-        self.tb_writer = prepare_output_and_logger(dataset)
+        self.tb_writer = prepare_output_and_logger(dataset)  # writes cfg_args needed by render_by_interp
 
         # print(self.dataset.splat_type)
         # sys.exit()
         
-        # if self.dataset.splat_type == 'GS':
-        #     self.gaussians = GaussianModel(dataset.sh_degree, self.dtype, self.args.max_splats)
+        # If --init_type dust3r, redirect source_path to the dust3r/ sibling folder.
+        # coarse_init_infer.py saves its output there (cameras.txt, images.txt, points3D.ply)
+        # so the scene loader picks it up without any other changes.
+        if getattr(args, 'init_type', 'colmap') == 'dust3r':
+            scene_root  = os.path.dirname(self.dataset.source_path.rstrip('/'))
+            dust3r_path = os.path.join(scene_root, 'dust3r')
+            if os.path.exists(dust3r_path):
+                print(f'Init: DUSt3R  ({dust3r_path})')
+                self.dataset.source_path = dust3r_path
+            else:
+                print(f'Init: DUSt3R requested but {dust3r_path} not found — falling back to COLMAP')
+        else:
+            print(f'Init: COLMAP  ({self.dataset.source_path})')
+
         if self.dataset.splat_type in ['GS', 'GSE', 'SQ', 'SQE']:
             self.gaussians = GaussianModel2(dataset.sh_degree, self.dtype, self.args.max_splats, self.device)
 
         self.scene = Scene(dataset, self.gaussians, opt=args, shuffle=False)                                                                      
 
-        if self.dataset.splat_type == 'GS':
-            self.scene.gaussians._exp12.requires_grad_(False)
-            self.scene.gaussians._exp3.requires_grad_(False)
-        elif self.dataset.splat_type == 'GSE':
-            self.scene.gaussians._exp12.requires_grad_(False)
-        elif self.dataset.splat_type == 'SQ':
-            self.scene.gaussians._exp3.requires_grad_(False)
+        # Freeze ALL shape exponents at start for every splat type.
+        # Extreme e1/e2/e3 gate the gradient signal back to position/scale/colour:
+        #   - box e1/e2 (→0.1): d(d4)/d(xs) = 20*|xs/s1|^19 → near-zero inside, explosive at edges
+        #   - sharp e3 (→5.0): position gradient lives only in a razor-thin boundary rim
+        # Frozen until E3_UNFREEZE_STEP (after densification) so positions converge first.
+        # GS/GSE/SQ always keep their respective freezes beyond that.
+        self.scene.gaussians._exp12.requires_grad_(False)
+        self.scene.gaussians._exp3.requires_grad_(False)
         
         self.gaussians.training_setup(opt)
         if self.checkpoint:
             (model_params, first_iter) = torch.load(self.checkpoint)
-            self.gaussians.restore(model_params, self.opt)        
+            self.gaussians.restore(model_params, self.opt)
 
         self.train_cams_init = self.scene.getTrainCameras().copy()
+        if self.train_cams_init:
+            c = self.train_cams_init[0]
+            print(f"Image size: {c.image_width}×{c.image_height}  ({len(self.train_cams_init)} train cameras)")
         os.makedirs(self.scene.model_path + '/pose', exist_ok=True)
         save_pose(self.scene.model_path + '/pose' + "/pose_org.npy", self.gaussians.P, self.train_cams_init)
         bg_color = [1, 1, 1] if self.dataset.white_background else [0, 0, 0]
@@ -328,16 +338,34 @@ class SceneTrainer(Trainer):
     
         self.viewpoint_stack = None
         self.ema_loss_for_log = 0.0
-        self.progress_bar = tqdm(range(first_iter, self.opt.iterations), desc="Training progress")
+        # progress bar is handled by Trainer.train() — don't create a second one here
         first_iter += 1
         
         
         super().__init__(model=self.gaussians,
-                         train_num_steps=self.opt.iterations)
+                         train_num_steps=self.opt.iterations,
+                         results_folder=self.args.results)  # redirect to capital-R Results/
+
+        os.makedirs(os.path.join(self.args.results, "train", "rgb"),   exist_ok=True)
+        os.makedirs(os.path.join(self.args.results, "train", "depth"), exist_ok=True)
 
         if args.step != 0:
             self.gaussians.load_ply(self.args.results + '/model.ply')
             self.step = args.step
+        else:
+            csv_path = self.args.results + '/train.csv'
+            if os.path.isfile(csv_path):
+                os.remove(csv_path)
+
+        # If resuming past E3_UNFREEZE_STEP the == check in on_train_step never fires.
+        # Re-apply the unfreeze now that self.step is correct.
+        E3_UNFREEZE_STEP = 15000
+        if self.step >= E3_UNFREEZE_STEP:
+            splat_type = self.dataset.splat_type
+            if splat_type in ['SQ', 'SQE']:
+                self.gaussians._exp12.requires_grad_(True)
+            if splat_type in ['GSE', 'SQE']:
+                self.gaussians._exp3.requires_grad_(True)
 
         # total_memory = torch.cuda.get_device_properties(0).total_memory / 2**30
         # allocated_memory = torch.cuda.memory_allocated(0) / 2**30
@@ -351,8 +379,6 @@ class SceneTrainer(Trainer):
         
         
     def on_train_step(self):
-
-        os.makedirs(os.path.join(self.args.results, "train"), exist_ok=True)
 
         self.gaussians._xyz.retain_grad()
 
@@ -385,6 +411,19 @@ class SceneTrainer(Trainer):
         if args.optim_pose==False:
             self.gaussians.P.requires_grad_(False)
 
+        # Unfreeze shape exponents once densification has finished and positions are good.
+        # e1/e2 control cross-section shape; e3 controls boundary sharpness.
+        # Both gate gradients back to position/scale, so must be frozen while positions settle.
+        E3_UNFREEZE_STEP = 15000
+        if self.step == E3_UNFREEZE_STEP:
+            splat_type = self.dataset.splat_type
+            if splat_type in ['SQ', 'SQE']:
+                self.gaussians._exp12.requires_grad_(True)
+                print(f'  [step {self.step}] e1/e2 unfrozen (cross-section shape)')
+            if splat_type in ['GSE', 'SQE']:
+                self.gaussians._exp3.requires_grad_(True)
+                print(f'  [step {self.step}] e3 unfrozen (boundary sharpness)')
+
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if self.step % 1000 == 0:
             self.gaussians.oneupSHdegree()
@@ -392,8 +431,8 @@ class SceneTrainer(Trainer):
         # Pick a random Camera
         if not self.viewpoint_stack:
             self.viewpoint_stack = self.scene.getTrainCameras().copy()
-        viewpoint_cam = self.viewpoint_stack.pop(0)
-        # viewpoint_cam = self.viewpoint_stack.pop(randint(0, len(self.viewpoint_stack)-1))
+        # viewpoint_cam = self.viewpoint_stack.pop(0)
+        viewpoint_cam = self.viewpoint_stack.pop(randint(0, len(self.viewpoint_stack)-1))
         pose = self.gaussians.get_RT(viewpoint_cam.uid)
 
         # print(viewpoint_cam.uid)
@@ -448,8 +487,28 @@ class SceneTrainer(Trainer):
         SSIM = 1.0 - ssim(image, gt_image)
         PSNR = psnr(image, gt_image)
         LPIPS = lpips_model(image, gt_image)
-                
+
         loss = (1.0 - self.opt.lambda_dssim) * L1 + self.opt.lambda_dssim * SSIM
+
+        # Scale regularisation — penalise effective radius (scale × d4_threshold) above 1× scene extent.
+        # Targets large soft splats that escape opacity/size pruning and create "white card" artefacts.
+        with torch.no_grad():
+            _e3  = self.gaussians.get_exp[:, 2].clamp(min=0.1).detach() if hasattr(self.gaussians, 'get_exp') else torch.ones(self.gaussians.get_scaling.shape[0], device=self.device, dtype=self.dtype)
+            _thr = torch.pow(torch.tensor(5.5, device=self.device, dtype=self.dtype), 1.0 / _e3)
+        _eff_scale   = self.gaussians.get_scaling.norm(dim=1) * _thr.detach()
+        _max_allowed = 1.0 * self.scene.cameras_extent
+        _excess      = torch.relu(_eff_scale - _max_allowed)
+        L_scale      = _excess.pow(2).mean() * 0.01
+        loss         = loss + L_scale
+
+        # Anisotropy regularisation — penalise splats where one axis is >10× another.
+        # _scaling is in log-space, so log(s_max/s_min) = max(_scaling) - min(_scaling).
+        # Needle-like splats (e.g. 100:1 ratio) cause streak artefacts; 10:1 is a generous cutoff.
+        _log_s        = self.gaussians._scaling                                   # (N, 3)
+        _log_ratio    = _log_s.max(dim=1).values - _log_s.min(dim=1).values      # (N,)
+        _MAX_LOG_RATIO = 2.3026  # log(10) — allow up to 10:1 scale ratio
+        L_aniso       = torch.relu(_log_ratio - _MAX_LOG_RATIO).pow(2).mean() * 0.01
+        loss          = loss + L_aniso
 
         # with torch.autograd.set_detect_anomaly(True):
         #     # self.accelerator.backward(loss)
@@ -561,23 +620,48 @@ class SceneTrainer(Trainer):
         # print("instantsplat_train_time_mean: ", train_time.mean())
         # print("instantsplat_train_time_median: ", np.median(train_time))
 
-        if os.path.isfile(self.args.results + '/results_train.csv'):
-            results = pd.read_csv(self.args.results + '/results_train.csv', index_col=None)
-        else:
-            results = pd.DataFrame(columns=['L1', 'SSIM', 'PSNR', 'Loss', 'LPIPS', 'Allocated_GPU', 'Available_GPU'])
+        if self.step % 100 == 0 or self.step == self.opt.iterations - 1:
+            csv_path = self.args.results + '/train.csv'
+            if os.path.isfile(csv_path):
+                results = pd.read_csv(csv_path, index_col=None)
+                # Strip old summary block (empty row + mean row appended at end of last save)
+                if len(results) >= 2 and results.iloc[-2].isna().all():
+                    results = results.iloc[:-2].reset_index(drop=True)
+            else:
+                results = pd.DataFrame(columns=['Iteration', 'L1', 'PSNR', 'SSIM', 'LPIPS', 'Loss', 'N_Splats', 'Allocated_GPU', 'Available_GPU'])
 
-        df = pd.DataFrame({'L1':[L1.item()], 'SSIM':[1-SSIM.item()], 'PSNR':[PSNR.item()], 'Loss':[loss.item()], 'LPIPS':[LPIPS.item()], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
-        results = pd.concat([results, df], ignore_index=True)
-        results.to_csv(self.args.results + "/results_train.csv", index=False)
-            
-        img = (image.clamp(0, 1) * 255).to(dtype=torch.uint8).permute(1, 2, 0).detach().cpu().numpy()
-        img = Image.fromarray(img)
-        # print(img.shape, image.dtype)
-        name = '0' * (4 - len(str(self.step))) + str(self.step)
-        img.save(self.args.results + f"/train/{name}.png")
+            df = pd.DataFrame({'Iteration':[self.step], 'L1':[L1.item()], 'PSNR':[PSNR.item()], 'SSIM':[1-SSIM.item()], 'LPIPS':[LPIPS.item()], 'Loss':[loss.item()], 'N_Splats':[self.gaussians.get_xyz.shape[0]], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
+            results = pd.concat([results, df], ignore_index=True)
 
-        # if (self.step + 1) % 1 == 0
-        self.gaussians.save_ply(self.args.results + f'/model.ply')
+            # Summary: empty row then mean of last 10 data rows (last ~1k iterations)
+            n_summary = min(10, len(results))
+            summary_row = results.iloc[-n_summary:].mean(numeric_only=True).to_frame().T
+            empty_row   = pd.DataFrame([[None] * len(results.columns)], columns=results.columns)
+            full = pd.concat([results, empty_row, summary_row], ignore_index=True)
+            full.to_csv(csv_path, index=False)
+
+            name = f'{self.step:06d}'
+
+            # RGB render
+            img_np = (image.clamp(0, 1) * 255).to(dtype=torch.uint8).permute(1, 2, 0).detach().cpu().numpy()
+            Image.fromarray(img_np).save(self.args.results + f"/train/rgb/{name}.png")
+
+            # Depth map — viridis colourmap, closer = yellow, far = purple
+            d_np = depth.detach().cpu().numpy()
+            mask = d_np > 0
+            d_norm = np.zeros_like(d_np)
+            if mask.any():
+                lo, hi = d_np[mask].min(), d_np[mask].max()
+                if hi > lo:
+                    d_norm[mask] = 1.0 - (d_np[mask] - lo) / (hi - lo)  # invert: closer = 1
+                else:
+                    d_norm[mask] = 0.5
+            cmap = plt.get_cmap('viridis')
+            depth_rgb = (cmap(d_norm)[:, :, :3] * 255).astype(np.uint8)
+            depth_rgb[~mask] = 0
+            Image.fromarray(depth_rgb).save(self.args.results + f"/train/depth/{name}.png")
+
+            self.gaussians.save_ply(self.args.results + f'/model.ply')
         # self.gaussians.load_ply(self.args.results + '/model.ply')
 
         # torch.autograd.set_detect_anomaly(False)
@@ -596,40 +680,55 @@ class SceneTrainer(Trainer):
 
     
     def on_densify_step(self, render_pkg):
-        print('Densifying')
-        
-        image = render_pkg["render"]                                 # (3, H, W)
-        depth = render_pkg["depth"]                                  # (H, W)
-        visibility_filter = render_pkg["visibility_filter"]          # (N,)
-        radii = render_pkg["radii"]                                  # (M,)
+        # on_densify_step: Update screen-size tracking and run clone/prune.
+        #
+        # Steps:
+        #   1. Extract visibility and radii from render_pkg
+        #   2. Update max_radii2D for all currently visible splats
+        #   3. Clone high-gradient splats and prune low-opacity / large-screen ones
+        #   4. Cap total splat count at max_splats
 
-        # Densification
-        # Keep track of max radii in image-space for pruning
-        # print(self.gaussians.max_radii2D.max(), visibility_filter.shape)
-        
-        # self.gaussians.max_radii2D[visibility_filter] =                                                                   torch.max(self.gaussians.max_radii2D[visibility_filter], radii)
-        # self.gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-        # self.gaussians.add_densification_stats(self.gaussians._xyz, visibility_filter)
+        # Step 1: unpack
+        visibility_filter = render_pkg["visibility_filter"]   # (N,) bool — frustum culling mask
+        radii             = render_pkg["radii"]               # (M,) int  — pixel-space radii of visible splats
 
-        # print(self.gaussians._xyz.grad.shape, self.gaussians._xyz.grad.max())
+        # Step 2: track largest screen-space radius seen per splat (for size-based pruning)
+        self.gaussians.max_radii2D[visibility_filter] = torch.max(
+            self.gaussians.max_radii2D[visibility_filter],
+            radii.float())
 
+        # Step 3: clone and prune
         if self.step > self.opt.densify_from_iter and self.step % self.opt.densification_interval == 0:
-            size_threshold = 20 if self.step > self.opt.opacity_reset_interval else None
-            self.gaussians.densify_and_prune(self.opt.densify_grad_threshold, 0.1,                                          self.scene.cameras_extent, size_threshold)
+            # Screen-space size threshold disabled: the original value of 20px was
+            # calibrated for full-resolution images. At images_8 (624px wide) it removes
+            # background/sky splats that are legitimately needed for coverage.
+            # World-space effective-radius pruning in densify_and_prune handles oversized splats.
+            size_threshold = None
+            self.gaussians.densify_and_prune(
+                self.opt.densify_grad_threshold, 0.1,
+                self.scene.cameras_extent, size_threshold)
+            print(f'  [densify] splats after clone+prune: {self.gaussians.get_xyz.shape[0]}')
 
-        # print(self.gaussians._xyz.shape)
-        # print(self.gaussians._xyz.grad.shape, self.gaussians._xyz.grad.max())
+        # Step 4: hard cap — prune randomly if splat count exceeds max_splats
+        N = self.gaussians.get_xyz.shape[0]
+        if N > self.args.max_splats:
+            keep = torch.ones(N, dtype=torch.bool, device=self.gaussians.get_xyz.device)
+            # Mark a random selection of excess splats for removal
+            excess_indices = torch.randperm(N, device=self.gaussians.get_xyz.device)[self.args.max_splats:]
+            keep[excess_indices] = False
+            self.gaussians.prune_points(~keep)
+            print(f'  [densify] capped to max_splats={self.args.max_splats}')
 
         return
 
 
     def evaluate(self):
 
-        os.makedirs(os.path.join(self.args.results, "eval"), exist_ok=True)
+        os.makedirs(os.path.join(self.args.results, "eval", "rgb"),   exist_ok=True)
+        os.makedirs(os.path.join(self.args.results, "eval", "depth"), exist_ok=True)
 
         self.gaussians.load_ply(self.args.results + '/model.ply')
-
-        self.gaussians._exp12 = nn.Parameter(torch.zeros_like(self.gaussians._exp12, dtype=self.dtype, device=self.device).requires_grad_(False))
+        # Evaluate the model as-is — do not reset shape parameters
         
         # self.gaussians.load_ply(self.args.results[:-3] + 'GSE/' + '/model.ply')
         # self.gaussians._exp3 = nn.Parameter(torch.zeros_like(self.gaussians._exp3, dtype=self.dtype, device=self.device-3.688879454216).requires_grad_(True)) 
@@ -638,19 +737,19 @@ class SceneTrainer(Trainer):
         
         # sys.exit()
         
-        results = pd.DataFrame(columns=['L1', 'SSIM', 'PSNR', 'Loss', 'LPIPS', 'Allocated_GPU', 'Available_GPU'])
+        results = pd.DataFrame(columns=['L1', 'PSNR', 'SSIM', 'LPIPS', 'Loss', 'N_Splats', 'Allocated_GPU', 'Available_GPU'])
 
-        if not self.viewpoint_stack:
-            self.viewpoint_stack = self.scene.getTrainCameras().copy()
-        
-        for i in range(0, len(self.viewpoint_stack)):
-            
-            # Pick a random Camera
-            # viewpoint_cam = self.viewpoint_stack.pop(randint(0, len(self.viewpoint_stack)-1))
-            viewpoint_cam = self.viewpoint_stack.pop(0)
-            pose = self.gaussians.get_RT(viewpoint_cam.uid)
+        # Evaluate on held-out test cameras (every 8th image, never seen during training).
+        # Use the camera's original COLMAP pose — test cameras have no entry in the
+        # optimised-pose tensor P, so get_RT() must not be called for them.
+        all_cameras = self.scene.getTestCameras().copy()
 
-            bg = torch.rand((3), device=device) if self.opt.random_background else self.background
+        for i, viewpoint_cam in enumerate(all_cameras):
+            pose = get_tensor_from_camera(
+                viewpoint_cam.world_view_transform.transpose(0, 1)
+            ).to(dtype=self.dtype, device=self.device)
+
+            bg = torch.rand((3), device=self.device) if self.opt.random_background else self.background
 
             # Free intermediate variables after the backward pass if they're no longer needed
             render_pkg = None  # Free intermediate variable by removing reference
@@ -680,15 +779,7 @@ class SceneTrainer(Trainer):
             PSNR = psnr(image, gt_image)
             LPIPS = lpips_model(image, gt_image)
 
-            I = image.permute(1, 2, 0).detach().cpu().numpy() # (H, W, 3)
-            I_GT = gt_image.permute(1, 2, 0).detach().cpu().numpy() # (H, W, 3)
-            diff = ((I - I_GT)**2).sum(axis=-1) # (H, W)
-            D = depth.clip(0, 3).detach().cpu().numpy() # (H, W)
-            
-            plt.imshow(I_GT), plt.show()
-            plt.imshow(I), plt.show()
-            plt.imshow(diff), plt.show()
-            plt.imshow(D, cmap='jet_r'), plt.show()
+            # (display calls removed — saves to eval/rgb and eval/depth instead)
 
             
             
@@ -702,27 +793,38 @@ class SceneTrainer(Trainer):
             total_memory = torch.cuda.get_device_properties(0).total_memory / 2**30
             allocated_memory = torch.cuda.memory_allocated(0) / 2**30
             reserved_memory = torch.cuda.memory_reserved(0) / 2**30
-            available_memory = total_memory - reserved_memory / 2 **30
-            # print(f"Allocated GPU Memory: {allocated_memory / (1024**3):.2f} GB            ", f"Available (Unallocated) GPU Memory: {available_memory / (1024**3):.2f} GB")
+            available_memory = total_memory - reserved_memory
 
-            
-            df = pd.DataFrame({'L1':[L1.item()], 'SSIM':[SSIM.item()], 'PSNR':[PSNR.item()], 'Loss':[loss.item()], 'LPIPS':[LPIPS.item()], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
+            df = pd.DataFrame({'L1':[L1.item()], 'PSNR':[PSNR.item()], 'SSIM':[(1-SSIM).item()], 'LPIPS':[LPIPS.item()], 'Loss':[loss.item()], 'N_Splats':[self.gaussians.get_xyz.shape[0]], 'Allocated_GPU':[allocated_memory], 'Available_GPU':[available_memory]})
             results = pd.concat([results, df], ignore_index=True)
-            results.to_csv(self.args.results + "/results_eval.csv", index=False)
+            results.to_csv(self.args.results + "/test.csv", index=False)  # incremental save
 
-            # image = image.clip(0, 1) * 255
-            img = (image.clip(0, 1) * 255).to(dtype=torch.uint8).permute(1, 2, 0).detach().cpu().numpy()
-            img = Image.fromarray(img)
-            # print(img.shape, image.dtype)
-            name = '0' * (4 - len(str(i))) + str(i)
-            img.save(self.args.results + f"/eval/{name}.png")
+            name = f'{i:06d}'
 
-            depth_img = (depth - depth.min()) / (depth.max() - depth.min())
-            depth_img = (depth_img * 255).to(dtype=torch.uint8).detach().cpu().numpy()
-            depth_img = Image.fromarray(depth_img)
-            # print(img.shape, image.dtype)
-            name = 'd' + '0' * (4 - len(str(i))) + str(i)
-            depth_img.save(self.args.results + f"/eval/{name}.png")
+            # RGB render
+            img_np = (image.clip(0, 1) * 255).to(dtype=torch.uint8).permute(1, 2, 0).detach().cpu().numpy()
+            Image.fromarray(img_np).save(self.args.results + f"/eval/rgb/{name}.png")
+
+            # Depth map — viridis colourmap, closer = yellow, far = purple
+            d_np = depth.detach().cpu().numpy()
+            mask = d_np > 0
+            d_norm = np.zeros_like(d_np)
+            if mask.any():
+                lo, hi = d_np[mask].min(), d_np[mask].max()
+                if hi > lo:
+                    d_norm[mask] = 1.0 - (d_np[mask] - lo) / (hi - lo)
+                else:
+                    d_norm[mask] = 0.5
+            cmap = plt.get_cmap('viridis')
+            depth_rgb = (cmap(d_norm)[:, :, :3] * 255).astype(np.uint8)
+            depth_rgb[~mask] = 0
+            Image.fromarray(depth_rgb).save(self.args.results + f"/eval/depth/{name}.png")
+
+        # Append mean summary row after all cameras are evaluated
+        summary_row = results.mean(numeric_only=True).to_frame().T
+        empty_row   = pd.DataFrame([[None] * len(results.columns)], columns=results.columns)
+        final = pd.concat([results, empty_row, summary_row], ignore_index=True)
+        final.to_csv(self.args.results + "/test.csv", index=False)
 
         return results
 
@@ -754,6 +856,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_splats", type=int, default=200000)
     parser.add_argument("--step", type=int, default=0)
     parser.add_argument("--device", type=str, default='cuda')
+    parser.add_argument("--init_type", type=str, default='colmap',
+                        choices=['colmap', 'dust3r'],
+                        help="Point cloud initialisation: 'colmap' (default) or "
+                             "'dust3r' (requires coarse_init_infer.py to have been run first)")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -788,7 +894,7 @@ if __name__ == "__main__":
 
     
     trainer.train()
-    # trainer.evaluate()
+    trainer.evaluate()
 
 
     

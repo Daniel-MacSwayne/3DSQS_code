@@ -55,10 +55,9 @@ class Trainer(object):
 
         self.accelerator = Accelerator(
             split_batches=split_batches,
-            # mixed_precision = 'fp16' if fp16 else 'no', 
             mixed_precision = None,
-            project_dir=results_folder if with_tracking else None,
-            log_with="all",
+            project_dir=None,   # no tracking directory — prevents trainer/ folder and event files
+            log_with=[],        # disable all loggers (TensorBoard, W&B, etc.)
         )
 
         self.accelerator.native_amp = amp
@@ -86,15 +85,9 @@ class Trainer(object):
 
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
-        # accelerator tracking
-        if self.with_tracking:
-            run = os.path.split(__file__)[-1].split(".")[0]
-            self.accelerator.init_trackers(run, config={
-                'train_lr':train_lr,
-                'train_batch_size':train_batch_size,
-                'gradient_accumulate_every':gradient_accumulate_every,
-                'train_num_steps':train_num_steps,
-            })
+        # accelerator tracking disabled — no event files or tracker folders
+        # if self.with_tracking:
+        #     self.accelerator.init_trackers(...)
 
 
 
@@ -180,9 +173,9 @@ class Trainer(object):
                                 param.grad[nan_mask] = 0.0
                             param.grad = param.grad.clamp(-1e3, 1e3)
                     
-                # print(self.step, self.opt.densify_from_iter, self.opt.densification_interval)
-                # if self.step >= self.opt.densify_from_iter and self.step % self.opt.densification_interval == 0:
-                #     self.on_densify_step(render_pkg)
+                # Densify (clone high-gradient splats) and prune (remove low-opacity splats)
+                if self.step >= self.opt.densify_from_iter and self.step % self.opt.densification_interval == 0:
+                    self.on_densify_step(render_pkg)
 
                 # all reduce to get the total loss
                 total_loss = accelerator.reduce(total_loss)
@@ -214,5 +207,6 @@ class Trainer(object):
                 # sys.exit()
                 
 
-        if self.with_tracking:
-            accelerator.end_training()
+        # tracking disabled — nothing to end
+        # if self.with_tracking:
+        #     accelerator.end_training()

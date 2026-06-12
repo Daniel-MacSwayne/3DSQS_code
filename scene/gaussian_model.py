@@ -392,17 +392,18 @@ class GaussianModel:
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             stored_state = self.optimizer.state.get(group['params'][0], None)
+            orig_grad = group["params"][0].requires_grad  # preserve freeze state
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
                 stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
+                group["params"][0] = nn.Parameter(group["params"][0][mask], requires_grad=orig_grad)
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                group["params"][0] = nn.Parameter(group["params"][0][mask], requires_grad=orig_grad)
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
@@ -433,13 +434,17 @@ class GaussianModel:
                 stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
                 stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
 
+                # Preserve requires_grad from the existing parameter — never force True.
+                # Forcing True here was overriding the e1/e2/e3 freeze on every densification call.
+                orig_grad = group["params"][0].requires_grad
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0), requires_grad=orig_grad)
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                orig_grad = group["params"][0].requires_grad
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0), requires_grad=orig_grad)
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
@@ -514,7 +519,12 @@ class GaussianModel:
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            # Effective scale = geometric scale × d4 threshold at alpha=1/255 cutoff.
+            # e3=0.9 makes effective radius 6.7× geometric scale — raw scale misses these.
+            _e3 = self.get_exp[:, 2].clamp(min=0.1) if hasattr(self, 'get_exp') else torch.ones(self.get_scaling.shape[0], device=self.get_scaling.device)
+            _thr = torch.pow(torch.tensor(5.5, device=self.get_scaling.device), 1.0 / _e3)
+            _eff = self.get_scaling.norm(dim=1) * _thr
+            big_points_ws = _eff > 1.0 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
@@ -627,8 +637,12 @@ class GaussianModel2:
     @property
     def get_exp(self):
         exp12 = self.exp_activation(self._exp12) * 1.8 + 0.1
-        exp3 = self.exp_activation(self._exp3) * 4.1 + 0.9
-        # exp3 = self.exp_activation(self._exp3) * 1.8 + 0.1
+        # e3: sigmoid(x) + 0.5 maps raw param to [0.5, 1.5].
+        # At init x=0: e3 = sigmoid(0)+0.5 = 1.0, and d(e3)/d(x) = 0.25 — gradient flows freely.
+        # The old formula (sigmoid(x)*4.1+0.9, clamped at min=1.0) placed the init value
+        # just below the clamp threshold (0.9999 < 1.0), so the clamp was always active and
+        # the gradient was permanently zero — e3 never trained at all.
+        exp3 = self.exp_activation(self._exp3) + 0.5
         exp = torch.cat([exp12, exp3], dim=-1)
         return exp
 
@@ -684,12 +698,11 @@ class GaussianModel2:
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
 
-        # I = np.zeros(pcd.points.shape[0], dtype=np.bool)
-        # I[np.random.permutation(pcd.points.shape[0])[:self.max_splats]] = True
-        # points = pcd.points[I]
-        # colors = pcd.colors[I]
-        points = pcd.points
-        colors = pcd.colors
+        # Subsample to max_splats using random permutation (matches GaussianModel behaviour)
+        I = np.zeros(pcd.points.shape[0], dtype=bool)
+        I[np.random.permutation(pcd.points.shape[0])[:self.max_splats]] = True
+        points = pcd.points[I]
+        colors = pcd.colors[I]
 
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(points)).to(dtype=self.dtype, device=self.device)
@@ -708,11 +721,12 @@ class GaussianModel2:
         exp12 = torch.tensor([[0, 0]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
         # exp12 = torch.tensor([[-1.25276, -1.25276]]).to(dtype=self.dtype, device=device).repeat(fused_point_cloud.shape[0], 1)
         # exp3 = torch.tensor([[-1.466337]]).to(dtype=self.dtype, device=device).repeat(fused_point_cloud.shape[0], 1)
-        exp3 = torch.tensor([[-3.688879454216]]).to(dtype=self.dtype, device=self.device).repeat(fused_point_cloud.shape[0], 1)
+        # raw=0 → sigmoid(0)+0.5 = 1.0 (sphere/ellipsoid boundary at init, gradient=0.25)
+        exp3 = torch.zeros((fused_point_cloud.shape[0], 1), dtype=self.dtype, device=self.device)
         # self._exp = self.get_exp
 
         # opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1)).to(dtype=self.dtype, device=device))
-        opacities = inverse_sigmoid(.8 * torch.ones((fused_point_cloud.shape[0], 1)).to(dtype=self.dtype, device=self.device))
+        opacities = inverse_sigmoid(.5 * torch.ones((fused_point_cloud.shape[0], 1)).to(dtype=self.dtype, device=self.device))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -908,24 +922,21 @@ class GaussianModel2:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for i, group in enumerate(self.optimizer.param_groups):
-            # print(i)
             if i == 8:
                 break
-            
+            orig_grad = group["params"][0].requires_grad  # preserve freeze state
             stored_state = self.optimizer.state.get(group['params'][0], None)
-            # print(stored_state["exp_avg"].shape)
-
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
                 stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
+                group["params"][0] = nn.Parameter(group["params"][0][mask], requires_grad=orig_grad)
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
+                group["params"][0] = nn.Parameter(group["params"][0][mask], requires_grad=orig_grad)
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
@@ -952,6 +963,7 @@ class GaussianModel2:
         for group in self.optimizer.param_groups[:-1]:
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
+            orig_grad = group["params"][0].requires_grad  # preserve freeze state
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
 
@@ -959,12 +971,12 @@ class GaussianModel2:
                 stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
 
                 del self.optimizer.state[group['params'][0]]
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0), requires_grad=orig_grad)
                 self.optimizer.state[group['params'][0]] = stored_state
 
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
-                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
+                group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0), requires_grad=orig_grad)
                 optimizable_tensors[group["name"]] = group["params"][0]
 
         return optimizable_tensors
@@ -989,9 +1001,19 @@ class GaussianModel2:
         self._exp12 = optimizable_tensors["exp12"]
         self._exp3 = optimizable_tensors["exp3"]
 
+        n_new  = new_xyz.shape[0]
+        n_old  = self.get_xyz.shape[0] - n_new
+
+        # Preserve max_radii2D for EXISTING splats — only zero the new ones.
+        # Previously this reset all splats to 0, breaking the screen-size pruning.
+        old_radii = self.max_radii2D[:n_old] if self.max_radii2D.shape[0] >= n_old else self.max_radii2D
+        self.max_radii2D = torch.cat([
+            old_radii,
+            torch.zeros(n_new, device=self.device, dtype=self.dtype)
+        ])
+
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device=self.device)
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=self.device)
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -1040,21 +1062,64 @@ class GaussianModel2:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_exp12, new_exp3)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
-        # grads = self.xyz_gradient_accum / self.denom
+        # densify_and_prune: grow the scene where under-represented, shrink splats that are too large.
+        #
+        # Steps:
+        #   1. Clone splats with high position gradients (under-reconstructed regions)
+        #   2. Split splats that are too large — halves their scale, preserves coverage.
+        #      Splitting instead of deleting is essential: deletion creates a black coverage gap
+        #      that the model cannot recover from (no splat remains to guide new ones in).
+        #   3. Prune truly dead splats (low opacity only — not size-based)
+
         grads = self._xyz.grad
         grads[grads.isnan()] = 0.0
 
+        # Step 1: clone under-represented splats
         self.densify_and_clone(grads, max_grad, extent)
-        # self.densify_and_split(grads, max_grad, extent)
 
+        # Step 2: split oversized splats rather than deleting them.
+        # Threshold matches the CUDA radius formula: radius = 3 * scale_norm / z * f_mean.
+        # A splat is "too large" if its geometric scale exceeds 1/3 of the scene extent.
+        # e3 is deliberately excluded — the CUDA kernel no longer uses e3 for radius.
+        _eff = self.get_scaling.norm(dim=1) * 3.0
+        too_large = _eff > 1.0 * extent
+        if too_large.any():
+            self._split_splats(too_large)
+
+        # Step 3: prune only low-opacity splats (dead splats, not coverage splats)
         prune_mask = (self.get_opacity < min_opacity).squeeze()
-        if max_screen_size:
-            big_points_vs = self.max_radii2D > max_screen_size
-            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
+
+    def _split_splats(self, mask, N=2):
+        """_split_splats: Replace each masked splat with N smaller copies.
+
+        Steps:
+          1. Sample N random offsets within the original splat's scale footprint
+          2. Create N copies at halved scale positioned around the original centre
+          3. Remove the original via prune_filter
+        """
+        # Step 1: random offsets within the original scale
+        stds    = self.get_scaling[mask].repeat(N, 1)
+        samples = torch.normal(mean=torch.zeros_like(stds), std=stds)
+        rots    = build_rotation(self._rotation[mask]).repeat(N, 1, 1)
+
+        # Step 2: build new smaller splats
+        new_xyz   = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[mask].repeat(N, 1)
+        new_scale = self.scaling_inverse_activation(self.get_scaling[mask].repeat(N, 1) / (0.8 * N))
+        new_rot   = self._rotation[mask].repeat(N, 1)
+        new_e12   = self._exp12[mask].repeat(N, 1)
+        new_e3    = self._exp3[mask].repeat(N, 1)
+        new_fdc   = self._features_dc[mask].repeat(N, 1, 1)
+        new_frest = self._features_rest[mask].repeat(N, 1, 1)
+        new_op    = self._opacity[mask].repeat(N, 1)
+
+        self.densification_postfix(new_xyz, new_fdc, new_frest, new_op, new_scale, new_rot, new_e12, new_e3)
+
+        # Step 3: remove originals
+        prune_filter = torch.cat((mask, torch.zeros(N * mask.sum(), device=self.device, dtype=torch.bool)))
+        self.prune_points(prune_filter)
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
