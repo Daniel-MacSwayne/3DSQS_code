@@ -1078,11 +1078,10 @@ class GaussianModel2:
         self.densify_and_clone(grads, max_grad, extent)
 
         # Step 2: split oversized splats rather than deleting them.
-        # Any splat whose effective radius (scale × 5.5^(1/e3)) exceeds 1× scene extent
-        # gets split into 2 copies at half scale, positioned within the original footprint.
-        _e3  = self.get_exp[:, 2].clamp(min=0.1)
-        _thr = torch.pow(torch.tensor(5.5, device=self.device), 1.0 / _e3)
-        _eff = self.get_scaling.norm(dim=1) * _thr
+        # Threshold matches the CUDA radius formula: radius = 3 * scale_norm / z * f_mean.
+        # A splat is "too large" if its geometric scale exceeds 1/3 of the scene extent.
+        # e3 is deliberately excluded — the CUDA kernel no longer uses e3 for radius.
+        _eff = self.get_scaling.norm(dim=1) * 3.0
         too_large = _eff > 1.0 * extent
         if too_large.any():
             self._split_splats(too_large)

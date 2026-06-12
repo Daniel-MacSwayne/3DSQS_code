@@ -66,41 +66,28 @@ __global__ void preprocessCUDA(
     means2D_out[idx] = { px, py };
     depths_out[idx]  = z;
 
-    // Step 3: estimate pixel-space bounding radius — covering the full alpha-visible footprint.
+    // Step 3: pixel-space bounding radius.
     //
-    // The weight at a pixel is G = exp(-F) where F = d4^e3.
-    // We render a pixel only when alpha = opacity * G >= 1/255.
-    // At the threshold (worst case opacity≈1): G = 1/255  →  F = ln(255) ≈ 5.5
-    //   d4^e3 = 5.5  →  d4 = 5.5^(1/e3)
-    //
-    // The spatial extent of d4 = threshold maps to scale * 5.5^(1/e3) in world space.
-    // In screen space this becomes:  radius = scale_norm * 5.5^(1/e3) / z * f_mean
+    // Mirror diff-gaussian-rasterization: use 3 * scale_norm / z * f_mean.
+    // This is analogous to GS's 3-sigma rule (radius = 3 * sqrt(max 2D eigenvalue))
+    // applied to the magnitude of the 3D scale vector without any exponent factors.
     float s0 = scales[idx*3+0], s1 = scales[idx*3+1], s2 = scales[idx*3+2];
-    float e3 = exps[idx*3+2];
     float scale_norm = sqrtf(s0*s0 + s1*s1 + s2*s2);
-    float threshold_d4 = powf(5.5f, 1.0f / fmaxf(e3, 0.1f));
-    int radius = (int)ceilf(scale_norm * threshold_d4 / z * f_mean);
-    // Cap at image diagonal to prevent degenerate huge radii from very large splats
+    int radius = (int)ceilf(3.f * scale_norm / z * f_mean);
+    // Cap at image diagonal to prevent degenerate radii from very large splats
     radius = max(1, min(radius, (int)sqrtf((float)(W*W + H*H))));
 
-    // Step 4: image-space frustum cull.
-    //
-    // Reject only if the splat's bounding circle doesn't overlap the image at all.
-    // The old angular test (|x/z| > tan_fov * 1.1) culls splats whose CENTRE is
-    // more than 10% outside the FOV — a margin of only ~27px at typical FOV/res.
-    // Large background splats (radius > 100px) centered just outside that margin
-    // were discarded even though their bodies covered significant portions of the
-    // image, leaving uncovered tiles that rendered as raw background colour and
-    // produced visible grid-aligned holes.
-    if (px + radius < 0.0f || px - radius >= (float)W ||
-        py + radius < 0.0f || py - radius >= (float)H) return;
-
-    radii_out[idx] = radius;
-
-    // Step 5: tile overlap count
+    // Step 4: frustum cull — mirror GS: reject only if the splat overlaps zero tiles.
+    // getRect() clamps to the tile grid, so a splat entirely off-screen produces an
+    // empty rectangle (rect_max == rect_min) and is discarded here.
     uint2 rect_min, rect_max;
     getRect({ px, py }, radius, rect_min, rect_max, grid);
     uint32_t n_tiles = (rect_max.x - rect_min.x) * (rect_max.y - rect_min.y);
+    if (n_tiles == 0) return;
+
+    radii_out[idx] = radius;
+
+    // Step 5: record tile overlap count
     tiles_touched[idx] = n_tiles;
 
     // Step 6: build R_cs (camera→shape) = R_sc.T

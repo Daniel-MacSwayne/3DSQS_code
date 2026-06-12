@@ -59,6 +59,8 @@ DEEP_BLENDING_SCENES = [
 
 # Mip_nerf_360 folders are lowercase; n_views=30, resolution=1 for all.
 MIP_NERF_360_SCENES = [
+    # Use images_8/ sub-folder (pre-downscaled 8×) — full-res images are 4-5K
+    # and would need 37+ GB GPU just to load. images_8 needs ~600 MB.
     ("bicycle",   30, 1),
     ("bonsai",    30, 1),
     ("counter",   30, 1),
@@ -118,6 +120,10 @@ def run_job(dataset, scene_path, output_path, scene, n_views, res):
         '--step',        '0',
         '--device',      DEVICE,
     ]
+
+    # Mip_nerf_360 scenes: use images_8/ to avoid loading 4-5K full-res images
+    if dataset == 'Mip_nerf_360':
+        cmd += ['--images', 'images_8']
 
     print(f'\n{"="*70}')
     print(f'[{datetime.now().strftime("%H:%M:%S")}] START  {dataset}/{scene}')

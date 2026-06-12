@@ -89,7 +89,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, eval):
             uid = idx + 1
 
         height = intr.height
-        width = intr.width            
+        width = intr.width
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
         pose =  np.vstack((np.hstack((R, T.reshape(3,-1))),np.array([[0, 0, 0, 1]])))
@@ -119,7 +119,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, eval):
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                               image_path=image_path, image_name=image_name, width=width, height=height)
-    
+
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos, poses
@@ -226,22 +226,23 @@ def readColmapSceneInfo(path, images, eval, args, opt, llffhold=2):
     sorted_poses = [poses[i] for i in sorting_indices]
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-    if eval:
-        # train_cam_infos = [c for idx, c in enumerate(cam_infos) if (idx+1) % llffhold != 0]
-        # test_cam_infos = [c for idx, c in enumerate(cam_infos) if (idx+1) % llffhold == 0]
-        # train_poses = [c for idx, c in enumerate(sorted_poses) if (idx+1) % llffhold != 0]
-        # test_poses = [c for idx, c in enumerate(sorted_poses) if (idx+1) % llffhold == 0]
-
+    if getattr(opt, 'get_video', False):
+        # Flythrough render: all interpolated cameras are train cameras — no holdout.
         train_cam_infos = cam_infos
-        test_cam_infos = cam_infos
-        train_poses = sorted_poses
-        test_poses = sorted_poses
-
+        test_cam_infos  = []
+        train_poses     = sorted_poses
+        test_poses      = []
+        print(f"  Flythrough cameras: {len(train_cam_infos)} (no holdout)")
     else:
-        train_cam_infos = cam_infos
-        test_cam_infos = []
-        train_poses = sorted_poses
-        test_poses = []
+        # Hold out every 8th camera (sorted by filename) as the test set.
+        # Standard protocol used by 3DGS, Scaffold-GS, Mip-Splatting, etc. across all three
+        # benchmark datasets (Mip-NeRF 360, Deep Blending, Tanks & Temples).
+        HOLDOUT = 8
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % HOLDOUT != 0]
+        test_cam_infos  = [c for idx, c in enumerate(cam_infos) if idx % HOLDOUT == 0]
+        train_poses     = [p for idx, p in enumerate(sorted_poses) if idx % HOLDOUT != 0]
+        test_poses      = [p for idx, p in enumerate(sorted_poses) if idx % HOLDOUT == 0]
+        print(f"  Train cameras: {len(train_cam_infos)},  Test cameras (1-in-{HOLDOUT} holdout): {len(test_cam_infos)}")
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
@@ -357,7 +358,103 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+def readTanksTemplesSceneInfo(path, images, eval, args, opt):
+    """Load a Tanks & Temples scene from the standard cams/ + images/ layout.
+
+    Each scene folder contains:
+      images/XXXXXXXX.jpg          — numbered frames
+      cams/XXXXXXXX_cam.txt        — matching camera files with extrinsic/intrinsic blocks
+
+    Camera file format:
+      extrinsic          ← keyword
+      [4×4 W2C matrix]
+                         ← blank line
+      intrinsic          ← keyword
+      [3×3 K matrix]
+                         ← blank line
+      [near] [far] ...   ← metadata (ignored)
+
+    Initial point cloud is synthesised from camera centres (no COLMAP points available).
+    """
+    cams_dir   = os.path.join(path, "cams")
+    images_dir = os.path.join(path, "images")
+
+    cam_files = sorted([
+        f for f in os.listdir(cams_dir) if f.endswith("_cam.txt")
+    ])
+
+    cam_infos  = []
+    cam_centers = []
+
+    for uid, cam_file in enumerate(cam_files, start=1):
+        cam_path = os.path.join(cams_dir, cam_file)
+        with open(cam_path) as f:
+            lines = [l.strip() for l in f.readlines()]
+
+        # Parse extrinsic (4×4 W2C)
+        assert lines[0] == "extrinsic", f"Unexpected cam file format in {cam_file}"
+        extr = np.array([[float(v) for v in lines[i].split()] for i in range(1, 5)])
+        R_w2c = extr[:3, :3]
+        T_w2c = extr[:3, 3]
+
+        # Parse intrinsic (3×3 K)
+        k_start = lines.index("intrinsic") + 1
+        K = np.array([[float(v) for v in lines[k_start + i].split()] for i in range(3)])
+        fx, fy = K[0, 0], K[1, 1]
+
+        # Image
+        img_stem = cam_file.replace("_cam.txt", "")
+        img_path = os.path.join(images_dir, img_stem + ".jpg")
+        if not os.path.exists(img_path):
+            continue
+
+        image = Image.open(img_path)
+        W, H  = image.size
+
+        FovX = focal2fov(fx, W)
+        FovY = focal2fov(fy, H)
+
+        R = R_w2c.T  # C2W rotation (3DGS convention matches readColmapCameras)
+        T = T_w2c
+
+        cam_infos.append(CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                                    image_path=img_path, image_name=img_stem,
+                                    width=W, height=H))
+        cam_centers.append(-R_w2c.T @ T_w2c)  # world-space camera centre
+
+    cam_infos = sorted(cam_infos, key=lambda x: x.image_name)
+
+    # Every-8th holdout — same protocol as COLMAP scenes
+    HOLDOUT = 8
+    train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % HOLDOUT != 0]
+    test_cam_infos  = [c for idx, c in enumerate(cam_infos) if idx % HOLDOUT == 0]
+    print(f"  Train cameras: {len(train_cam_infos)},  Test cameras (1-in-{HOLDOUT} holdout): {len(test_cam_infos)}")
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    # Build an initial point cloud from camera centres (proxy for scene geometry)
+    ply_path = os.path.join(path, "cameras_init.ply")
+    if not os.path.exists(ply_path):
+        centers = np.array(cam_centers)
+        colors  = (np.ones_like(centers) * 128).astype(np.uint8)
+        storePly(ply_path, centers, colors)
+    try:
+        pcd = fetchPly(ply_path)
+    except Exception:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path,
+                           train_poses=[],
+                           test_poses=[])
+    return scene_info
+
+
 sceneLoadTypeCallbacks = {
-    "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Colmap":       readColmapSceneInfo,
+    "Blender":      readNerfSyntheticInfo,
+    "TanksTemples": readTanksTemplesSceneInfo,
 }
