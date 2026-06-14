@@ -490,25 +490,36 @@ class SceneTrainer(Trainer):
 
         loss = (1.0 - self.opt.lambda_dssim) * L1 + self.opt.lambda_dssim * SSIM
 
-        # Scale regularisation — penalise effective radius (scale × d4_threshold) above 1× scene extent.
-        # Targets large soft splats that escape opacity/size pruning and create "white card" artefacts.
-        with torch.no_grad():
-            _e3  = self.gaussians.get_exp[:, 2].clamp(min=0.1).detach() if hasattr(self.gaussians, 'get_exp') else torch.ones(self.gaussians.get_scaling.shape[0], device=self.device, dtype=self.dtype)
-            _thr = torch.pow(torch.tensor(5.5, device=self.device, dtype=self.dtype), 1.0 / _e3)
-        _eff_scale   = self.gaussians.get_scaling.norm(dim=1) * _thr.detach()
+        # Scale regularisation — penalise effective radius (3 × scale_norm) above 1× scene extent.
+        # The factor 3 matches the CUDA kernel radius formula: radius = 3 * scale_norm / z * f_mean.
+        _eff_scale   = self.gaussians.get_scaling.norm(dim=1) * 3.0
         _max_allowed = 1.0 * self.scene.cameras_extent
         _excess      = torch.relu(_eff_scale - _max_allowed)
         L_scale      = _excess.pow(2).mean() * 0.01
         loss         = loss + L_scale
 
-        # Anisotropy regularisation — penalise splats where one axis is >10× another.
+        # Anisotropy regularisation — penalise splats where one axis is >5× another.
         # _scaling is in log-space, so log(s_max/s_min) = max(_scaling) - min(_scaling).
-        # Needle-like splats (e.g. 100:1 ratio) cause streak artefacts; 10:1 is a generous cutoff.
+        # Disc splats with extreme ratios (e.g. 20:1) cause "rotating" artefacts in novel views
+        # as their visible extent changes with camera angle.  5:1 allows sharp edges on thin
+        # objects (railings, cables) without creating large disc splats.
         _log_s        = self.gaussians._scaling                                   # (N, 3)
         _log_ratio    = _log_s.max(dim=1).values - _log_s.min(dim=1).values      # (N,)
-        _MAX_LOG_RATIO = 2.3026  # log(10) — allow up to 10:1 scale ratio
-        L_aniso       = torch.relu(_log_ratio - _MAX_LOG_RATIO).pow(2).mean() * 0.01
+        _MAX_LOG_RATIO = 1.6094  # log(5) — allow up to 5:1 scale ratio
+        L_aniso       = torch.relu(_log_ratio - _MAX_LOG_RATIO).pow(2).mean() * 0.05
         loss          = loss + L_aniso
+
+        # Small-splat regularisation — penalise high-opacity splats that are tiny relative to the
+        # scene scale.  Tiny splats (radius < 1 tile at background depth) cause a tile-grid colour
+        # mismatch: adjacent 16×16 tiles see different micro-splat subsets and composite to slightly
+        # different colours, producing a visible grid pattern in novel views.
+        # The penalty is weighted by detached opacity so transparent ghost splats are ignored.
+        _scale_norm   = self.gaussians.get_scaling.norm(dim=1)                   # (N,) world units
+        _opacity      = self.gaussians.get_opacity.squeeze().detach()             # (N,)
+        _MIN_SCALE    = 0.05 * self.scene.cameras_extent                         # ~5% of scene radius
+        _deficit      = torch.relu(_MIN_SCALE - _scale_norm)                     # (N,) > 0 for tiny splats
+        L_small       = (_deficit.pow(2) * _opacity).mean() * 0.05
+        loss          = loss + L_small
 
         # with torch.autograd.set_detect_anomaly(True):
         #     # self.accelerator.backward(loss)
@@ -554,7 +565,8 @@ class SceneTrainer(Trainer):
         # print("Gradient of self.P:", gaussians.P.grad)
 
         log_dict = {'total': loss, 'l1': L1,
-                    'ssim': 1-SSIM, 'psnr': PSNR}#, 'depth': None, }
+                    'ssim': 1-SSIM, 'psnr': PSNR,
+                    'L_scale': L_scale, 'L_aniso': L_aniso, 'L_small': L_small}
         # return loss, log_dict
         
         self.iter_end.record()
