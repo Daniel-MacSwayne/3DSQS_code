@@ -1,5 +1,9 @@
+# torch/torchvision: install separately first with the CUDA 11.8 wheel index,
+# e.g. pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118
 torch
 torchvision
+
+# --- inherited from upstream InstantSplat (DUSt3R / MASt3R init, pose optimisation) ---
 roma
 evo
 gradio
@@ -14,3 +18,16 @@ pyglet<2
 huggingface-hub[torch]>=0.22
 gdown
 imageio
+
+# --- required by this fork's training/render/eval scripts, missing from upstream list ---
+pandas              # train_joint.py: per-iteration CSV logging (train.csv / test.csv)
+plyfile             # scene/gaussian_model.py: .ply save/load for splat point clouds
+lpips               # train_joint.py, metrics.py: perceptual loss / eval metric
+torchviz            # train_joint.py: optional loss graph visualisation
+psutil              # train_joint.py: print_memory_usage()
+open3d              # utils/: point cloud I/O and visualisation helpers
+plotly              # interactive 3D debugging plots (Superquadric_Splatting helpers)
+scikit-image        # image metrics / processing helpers
+scikit-learn        # clustering / nearest-neighbour helpers
+accelerate          # huggingface-hub[torch] / dust3r model loading
+pillow              # PIL image I/O (usually pulled in transitively, listed explicitly)

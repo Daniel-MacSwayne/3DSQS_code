@@ -521,7 +521,8 @@ def rasterizer3(camera, means3D, colors_precomp, opacity, scales, rotations, exp
 
     depths = means3D[:, 2:]         # (M, 1)
     means2D = means3D[:, :2] / depths * f + c                                                         # (M, 2)
-    radii = (tc.norm(scales, dim=-1) / exps[:, 2].clamp(0.5, 1)) / means3D[:, 2] * f.mean()             # (M,)
+    # Radius formula matches the CUDA kernel: radius = 3 * scale_norm / z * f_mean (3-sigma rule, no e3 factor).
+    radii = (tc.norm(scales, dim=-1) * 3.0) / means3D[:, 2] * f.mean()             # (M,)
 
     ###########################################################################
     # Which splats are in each tile?

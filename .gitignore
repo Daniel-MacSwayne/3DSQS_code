@@ -1,3 +1,18 @@
 submodules/*/checkpoints/
 *.pth
 .ipynb_checkpoints/
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Compiled CUDA extension build artifacts (regenerate via `pip install -e .`)
+submodules/*/build/
+*.so
+*.o
+*.egg-info/
+
+# Training run outputs
+logs/
+output/
